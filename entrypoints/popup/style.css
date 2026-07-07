@@ -1,0 +1,306 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  width: 328px;
+  margin: 0;
+  background: #ffffff;
+  color: #0f172a;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.brandIcon {
+  flex-shrink: 0;
+  border-radius: 50%;
+}
+
+.logo {
+  display: block;
+  font-size: 22px;
+  font-weight: 800;
+  line-height: 1;
+  color: #0f172a;
+}
+
+.tagline {
+  margin: 5px 0 0;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.toggle {
+  position: relative;
+  display: inline-block;
+  width: 46px;
+  height: 26px;
+}
+
+.toggle input {
+  width: 0;
+  height: 0;
+  opacity: 0;
+}
+
+.slider {
+  position: absolute;
+  inset: 0;
+  background: #e2e8f0;
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 160ms ease, border-color 160ms ease;
+}
+
+.slider::before {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: #ffffff;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.24);
+  content: "";
+  transition: transform 160ms ease;
+}
+
+.toggle input:checked + .slider {
+  background: #20c997;
+  border-color: #20c997;
+}
+
+.toggle input:checked + .slider::before {
+  transform: translateX(20px);
+}
+
+.earnings {
+  padding: 18px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background:
+    radial-gradient(circle at 20% 0%, rgba(32, 201, 151, 0.12), transparent 32%),
+    linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+}
+
+.eyebrow {
+  margin: 0 0 10px;
+  color: #0ca678;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.ticker {
+  margin: 0;
+  color: #334155;
+  font-size: 22px;
+  font-weight: 750;
+  line-height: 1.18;
+}
+
+#earningsAmount {
+  color: #0f172a;
+  font-size: 34px;
+  white-space: nowrap;
+}
+
+#earningsAmount.is-loading {
+  color: transparent;
+  border-radius: 6px;
+  background: linear-gradient(90deg, #e2e8f0 25%, #f1f5f9 37%, #e2e8f0 63%);
+  background-size: 400% 100%;
+  animation: earnings-shimmer 1.4s ease infinite;
+}
+
+@keyframes earnings-shimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: 0 0; }
+}
+
+.subcopy {
+  margin: 10px 0 0;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #334155;
+  font-size: 12px;
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #20c997;
+  box-shadow: 0 0 0 4px rgba(32, 201, 151, 0.12);
+}
+
+.status.is-off .dot {
+  background: #64748b;
+  box-shadow: 0 0 0 4px rgba(100, 116, 139, 0.12);
+}
+
+.account {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.account button {
+  width: 100%;
+}
+
+.signinGate {
+  display: none;
+  flex-direction: column;
+  gap: 10px;
+  padding: 18px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background:
+    radial-gradient(circle at 20% 0%, rgba(32, 201, 151, 0.12), transparent 32%),
+    linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+}
+
+.signinGate button {
+  width: 100%;
+}
+
+/* Sign-in gate: hide the normal dashboard, show only the sign-in prompt */
+#app.not-signed-in .earnings,
+#app.not-signed-in .status,
+#app.not-signed-in #accountSection,
+#app.not-signed-in .toggle {
+  display: none;
+}
+
+#app.not-signed-in .signinGate {
+  display: flex;
+}
+
+h2 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.hint {
+  margin: 4px 0 0;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.emailRow {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+}
+
+input[type="email"] {
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  outline: none;
+  background: #ffffff;
+  color: #0f172a;
+  font-size: 13px;
+}
+
+input[type="email"]::placeholder {
+  color: #94a3b8;
+}
+
+input[type="email"]:focus {
+  border-color: #20c997;
+  box-shadow: 0 0 0 3px rgba(32, 201, 151, 0.14);
+}
+
+button {
+  min-width: 66px;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 8px;
+  background: #20c997;
+  color: #ffffff;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+button:hover {
+  background: #28dfaa;
+}
+
+button:disabled {
+  background: #e2e8f0;
+  color: #94a3b8;
+  cursor: default;
+}
+
+.message {
+  min-height: 16px;
+  margin: 0;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.message:empty {
+  display: none;
+}
+
+.message.is-success {
+  color: #20c997;
+}
+
+.message.is-error {
+  color: #fb7185;
+}
+
+.buildInfo {
+  margin: 0;
+  padding-top: 4px;
+  color: #94a3b8;
+  font-size: 10px;
+  text-align: center;
+}

@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Chatwait</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <div>
+          <div class="brand">
+            <img class="brandIcon" src="/chatwait-icon-round.svg" alt="" width="24" height="24" />
+            <span class="logo">Chatwait</span>
+          </div>
+          <p class="tagline">Get paid while AI thinks.</p>
+        </div>
+        <label class="toggle" aria-label="Enable sponsored cards">
+          <input type="checkbox" id="globalToggle" checked />
+          <span class="slider"></span>
+        </label>
+      </header>
+
+      <section class="signinGate" id="signinGate">
+        <h2>Sign in to start earning</h2>
+        <p class="hint">Sign in with Google to track earnings and get your referral link.</p>
+        <button id="signinBtn">Sign in with Google</button>
+        <p class="message" id="signinMessage"></p>
+      </section>
+
+      <section class="earnings">
+        <p class="eyebrow">Earnings</p>
+        <div class="ticker">You have earned <span id="earningsAmount" class="is-loading">$0.00</span></div>
+        <p class="subcopy">waiting for ChatGPT, Claude, and Gemini.</p>
+      </section>
+
+      <section class="status">
+        <span class="dot" id="statusDot"></span>
+        <span id="statusText">Sponsored cards are on</span>
+      </section>
+
+      <section class="account" id="accountSection">
+        <div>
+          <h2>Your account</h2>
+          <p class="hint">Manage your referral link and earnings on the dashboard.</p>
+        </div>
+        <button id="dashboardBtn">Open dashboard</button>
+      </section>
+
+      <p class="buildInfo" id="buildInfo"></p>
+    </div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

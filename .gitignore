@@ -1,0 +1,7 @@
+node_modules/
+.output/
+.wxt/
+*.zip
+.env.local
+.env*.local
+.chrome/

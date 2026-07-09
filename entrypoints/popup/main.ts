@@ -37,7 +37,9 @@ async function init() {
   renderEnabled(enabled);
   renderSignedIn(cachedSignedIn);
 
+  let earningsFetchAttempted = false;
   if (cachedSignedIn && deviceId && deviceToken) {
+    earningsFetchAttempted = true;
     await refreshEarnings(deviceId, deviceToken, cachedEarnings);
   }
 
@@ -51,11 +53,21 @@ async function init() {
   }
 
   const signedIn = !!signinResp?.signedIn;
-  if (signedIn === cachedSignedIn) return;
-
   renderSignedIn(signedIn);
-  if (signedIn && deviceId && deviceToken) {
-    await refreshEarnings(deviceId, deviceToken, cachedEarnings);
+
+  // The credentials snapshot at the top of init() can predate the CHECK_SIGNIN round trip:
+  // that call is what makes the background store a fresh device token (e.g. right after
+  // sign-in, or when the popup opened mid-write). If the eager fetch was skipped for lack of
+  // a token, re-read credentials from storage now instead of trusting the stale snapshot —
+  // otherwise a signed-in popup sits on the loading shimmer forever without ever fetching.
+  if (signedIn && !earningsFetchAttempted) {
+    const [freshDeviceId, freshDeviceToken] = await Promise.all([
+      storage.getDeviceId(),
+      storage.getDeviceToken(),
+    ]);
+    if (freshDeviceId && freshDeviceToken) {
+      await refreshEarnings(freshDeviceId, freshDeviceToken, cachedEarnings);
+    }
   }
 }
 

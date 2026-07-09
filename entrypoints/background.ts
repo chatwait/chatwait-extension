@@ -204,9 +204,13 @@ async function checkSignInStatus(): Promise<boolean> {
     // slow response for an old id stomp a newer, more current status.
     if ((await storage.getDeviceId()) !== deviceId) return storage.getSignedIn();
     const hadToken = !!(await storage.getDeviceToken());
+    // Token before the signed-in flag: the popup gates its earnings fetch on seeing both, so
+    // a reader must never observe signedIn=true while the freshly minted token isn't stored
+    // yet. (On unlink the same order clears the token first, which fails safe: signedIn=true
+    // with no token just skips the fetch until the flag flips.)
+    await storage.setDeviceToken(deviceToken);
     await storage.setSignedIn(linked);
     await storage.setProfileComplete(profileComplete);
-    await storage.setDeviceToken(deviceToken);
     if (!hadToken && deviceToken) {
       // First time this device gets its token (just signed in): the cached bundle was fetched
       // unauthenticated and its ads carry no ad_tokens, so impressions from it can't bill.

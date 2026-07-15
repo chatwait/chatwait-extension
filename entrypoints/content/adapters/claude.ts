@@ -25,6 +25,12 @@ function lastOf(list: NodeListOf<HTMLElement>): HTMLElement | null {
   return list.length ? list[list.length - 1] : null;
 }
 
+// How close (either side) a submit signal and a first-message mutation must land to be treated
+// as the same submission. The two fire within the same event turn on a real submit (Claude
+// renders the user message optimistically), so 1s is generous; anything further apart is a
+// history load with an unrelated submit signal nearby.
+const SUBMIT_CORROBORATION_MS = 1000;
+
 export class ClaudeAdapter implements PromptAdapter {
   host = 'claude.ai';
 
@@ -62,6 +68,19 @@ export class ClaudeAdapter implements PromptAdapter {
   private settling = true;
   private settleTimer: number | null = null;
 
+  // Wall-clock of the most recent send-button click / Enter keydown. A trailing message
+  // appearing where the adapter has never seen one (lastAnchoredMsg still null) is ambiguous:
+  // it's either the first prompt of a brand-new chat, or history loading after a sidebar nav
+  // from a message-less page (home / new chat) — and the unmounted-prior swap check below
+  // can't catch that nav, because there was no prior element to observe unmounting. Only a
+  // submit signal tells the two apart, so that case requires one within
+  // SUBMIT_CORROBORATION_MS. Since the submit handler can also run *after* the mutation (see
+  // the lastAnchoredMsg comment), the uncorroborated element is parked in pendingFirstMsg for
+  // handleSubmit to anchor if the signal arrives late.
+  private lastSubmitAt = 0;
+  private pendingFirstMsg: HTMLElement | null = null;
+  private pendingFirstMsgAt = 0;
+
   start(cb: PromptCallbacks) {
     this.cb = cb;
     this.attach();
@@ -89,6 +108,7 @@ export class ClaudeAdapter implements PromptAdapter {
     this.trackingObserver = null;
     this.doneObserver = null;
     this.settleTimer = null;
+    this.pendingFirstMsg = null;
   }
 
   private armSettle() {
@@ -133,7 +153,20 @@ export class ClaudeAdapter implements PromptAdapter {
   }
 
   private handleSubmit() {
+    this.lastSubmitAt = Date.now();
     this.cb?.onSubmit();
+    // If a fresh thread's first message hit the DOM before this handler ran, handleMutation
+    // parked it (no corroborating submit yet); anchor it now that the submit is confirmed.
+    const pending = this.pendingFirstMsg;
+    this.pendingFirstMsg = null;
+    if (
+      pending &&
+      Date.now() - this.pendingFirstMsgAt < SUBMIT_CORROBORATION_MS &&
+      pending === lastOf(document.querySelectorAll<HTMLElement>(USER_MSG))
+    ) {
+      this.cb?.onAnchorReady(resolveAnchor(pending));
+      this.watchForDone();
+    }
   }
 
   private handleMutation() {
@@ -169,6 +202,19 @@ export class ClaudeAdapter implements PromptAdapter {
       return;
     }
 
+    // No prior at all: brand-new-chat first prompt or sidebar nav from a message-less page
+    // (see the lastSubmitAt comment). Without a recent submit signal, park the element for a
+    // late-arriving handleSubmit and re-enter the settle window so the rest of an incoming
+    // thread's history rebaselines silently instead of anchoring.
+    if (!prior && Date.now() - this.lastSubmitAt >= SUBMIT_CORROBORATION_MS) {
+      this.pendingFirstMsg = newEl;
+      this.pendingFirstMsgAt = Date.now();
+      this.settling = true;
+      this.armSettle();
+      return;
+    }
+
+    this.pendingFirstMsg = null;
     this.cb?.onAnchorReady(resolveAnchor(newEl));
     this.watchForDone();
   }

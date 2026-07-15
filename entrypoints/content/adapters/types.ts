@@ -15,7 +15,9 @@ export interface PromptCallbacks {
    * shown card to sit after this new element without refetching the ad or restarting timing.
    * No-op if no card is currently shown. */
   onReanchor?(el: HTMLElement): void;
-  /** Response complete — stop impression timing; card itself stays visible until dismissed */
+  /** Response complete. The card stays visible until dismissed, and impression timing keeps
+   * running while it's on screen (a fast response must not cut dwell short of qualifying) —
+   * timing ends at dismiss or when the next prompt's card replaces this one. */
   onDone(): void;
 }
 

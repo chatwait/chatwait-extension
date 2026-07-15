@@ -9,7 +9,15 @@ const KEYS = {
   signedIn: 'chatwait_signed_in',
   profileComplete: 'chatwait_profile_complete',
   deviceToken: 'chatwait_device_token',
+  lastShownAd: 'chatwait_last_shown_ad',
 } as const;
+
+/** How long a remembered last-shown ad stays reusable. Generous versus the 60s impression
+ * pacing window it serves (see shared.ts), but a hard bound so a stale creative (or its
+ * ad_token) can never be resurrected long after it was served. */
+const LAST_SHOWN_AD_TTL_MS = 10 * 60 * 1000;
+
+type LastShownAdMap = Record<string, { ad: AdCreative; ts: number }>;
 
 export const storage = {
   async initDeviceId(): Promise<string> {
@@ -84,6 +92,23 @@ export const storage = {
 
   async setProfileComplete(value: boolean): Promise<void> {
     await set(KEYS.profileComplete, value);
+  },
+
+  /** Remembers the ad most recently served on a site so a prompt landing inside the
+   * impression pacing window can re-show it instead of rotating to a fresh creative that
+   * could not be tracked anyway (see onAnchorReady in entrypoints/content/shared.ts).
+   * Lives in extension storage rather than page localStorage so ad tokens never sit in
+   * site-readable storage, and so all tabs of a site agree on "the last ad shown here". */
+  async setLastShownAd(site: string, ad: AdCreative): Promise<void> {
+    const map = (await get<LastShownAdMap>(KEYS.lastShownAd)) ?? {};
+    map[site] = { ad, ts: Date.now() };
+    await set(KEYS.lastShownAd, map);
+  },
+
+  async getLastShownAd(site: string): Promise<AdCreative | null> {
+    const entry = ((await get<LastShownAdMap>(KEYS.lastShownAd)) ?? {})[site];
+    if (!entry || Date.now() - entry.ts > LAST_SHOWN_AD_TTL_MS) return null;
+    return entry.ad;
   },
 
   /** Signed proof the device_id was linked via real Google sign-in; attached to every event. */

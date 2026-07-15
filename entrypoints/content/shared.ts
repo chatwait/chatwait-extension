@@ -1,4 +1,4 @@
-import type { PromptAdapter, PromptCallbacks } from './adapters/types';
+import type { AdCreative, PromptAdapter, PromptCallbacks } from './adapters/types';
 import { AdCard } from './ad-card';
 import { ImpressionTracker } from './impression';
 import { storage } from '../../lib/storage';
@@ -40,20 +40,38 @@ export function attachAdInjection(adapter: PromptAdapter) {
         return;
       }
 
-      const response = await browser.runtime.sendMessage({ type: 'GET_AD' });
-      const ad = response?.ad;
-      if (!ad) {
-        const reason = response?.reason;
-        if (reason === 'not_signed_in') {
-          log.info('no ad: not signed in to Chatwait (click the extension icon to sign in)');
-        } else if (reason === 'no_bundle') {
-          log.info('no ad: ad bundle not loaded yet (background may still be fetching, or the last fetch failed)');
-        } else {
-          log.info(`no ad: background returned none (reason=${reason ?? 'unknown'})`);
-        }
-        return;
+      // Inside the pacing window after a qualified impression, a fresh creative could not be
+      // tracked anyway (tracker.start() declines during the cooldown), so the user would see
+      // a new ad, expect it to pay, and it never would. Re-show the ad already served on this
+      // site instead — visually it reads as the card following the conversation down the
+      // thread, not as a new unpaid ad.
+      let ad: AdCreative | null = null;
+      let repeated = false;
+      if (tracker.inCooldown()) {
+        ad = await storage.getLastShownAd(location.hostname);
+        repeated = !!ad;
       }
-      log.info(`showing ad "${ad.text}" (${ad.sponsor_name}, id=${ad.id})`);
+      if (!ad) {
+        const response = await browser.runtime.sendMessage({ type: 'GET_AD' });
+        ad = (response?.ad as AdCreative | undefined) ?? null;
+        if (!ad) {
+          const reason = response?.reason;
+          if (reason === 'not_signed_in') {
+            log.info('no ad: not signed in to Chatwait (click the extension icon to sign in)');
+          } else if (reason === 'no_bundle') {
+            log.info('no ad: ad bundle not loaded yet (background may still be fetching, or the last fetch failed)');
+          } else {
+            log.info(`no ad: background returned none (reason=${reason ?? 'unknown'})`);
+          }
+          return;
+        }
+        await storage.setLastShownAd(location.hostname, ad);
+      }
+      if (repeated) {
+        log.info(`re-showing previous ad "${ad.text}" (${ad.sponsor_name}, id=${ad.id}): impression pacing window still open`);
+      } else {
+        log.info(`showing ad "${ad.text}" (${ad.sponsor_name}, id=${ad.id})`);
+      }
 
       // Non-house ads arrive from ads-bundle already rewritten to our click-redirect URL
       // (`.../click?ad=<id>`), which looks up the real (e.g. Awin) destination server-side —
@@ -116,8 +134,10 @@ export function attachAdInjection(adapter: PromptAdapter) {
 
     onDone() {
       // Card stays on screen after the response finishes; only the user's own dismiss
-      // click removes it (or a new prompt's card replacing it).
-      tracker.stop();
+      // click removes it (or a new prompt's card replacing it). Impression timing keeps
+      // running for the same reason — a response faster than the dwell threshold must not
+      // cut qualification short while the card is still being looked at. The tracker stops
+      // on dismiss or on the next prompt's card (tracker.start() stops the previous run).
     },
   };
 

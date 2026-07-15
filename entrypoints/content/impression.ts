@@ -70,14 +70,37 @@ export class ImpressionTracker {
     return this.qualified;
   }
 
+  /** True while the client-side pacing window after this site's last qualified impression is
+   * still open. No new impression can qualify during it (start() declines to track), so the
+   * caller re-shows the previous ad instead of spending a fresh creative on a card that
+   * cannot pay (see onAnchorReady in shared.ts). Per-site by construction: the timestamp
+   * lives in page localStorage, which is scoped to the host origin. */
+  inCooldown(): boolean {
+    const lastImp = Number(localStorage.getItem(LAST_IMP_KEY) ?? 0);
+    return Date.now() - lastImp < MIN_INTERVAL_MS;
+  }
+
+  // Arms the qualification timer for however much dwell is still missing. Re-invoked whenever
+  // counting resumes (visibility/focus handlers below), so a blur or tab switch during the
+  // first 5s only delays qualification instead of permanently losing it — a single fixed
+  // timeout used to check once at the 5s mark and never again.
   private scheduleCheck() {
-    this.timer = setTimeout(() => {
-      if (!this.qualified && this.dwellMs() >= MIN_DWELL_MS) {
-        this.qualified = true;
-        this.recordImpression();
-        this.onQualifiedCb?.();
-      }
-    }, MIN_DWELL_MS);
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.checkQualification(), Math.max(0, MIN_DWELL_MS - this.dwellMs()));
+  }
+
+  private checkQualification() {
+    this.timer = null;
+    if (this.qualified) return;
+    if (this.dwellMs() >= MIN_DWELL_MS) {
+      this.qualified = true;
+      this.recordImpression();
+      this.onQualifiedCb?.();
+    } else if (this.lastVisibleStart) {
+      // Fired short while counting (part of the window was spent hidden/blurred) — re-arm for
+      // the remainder. If currently paused, the resume handlers re-arm instead.
+      this.scheduleCheck();
+    }
   }
 
   private flush() {
@@ -90,6 +113,7 @@ export class ImpressionTracker {
   private onVisibilityChange() {
     if (document.visibilityState === 'visible') {
       this.lastVisibleStart = Date.now();
+      if (!this.qualified) this.scheduleCheck();
     } else {
       this.flush();
     }
@@ -98,6 +122,7 @@ export class ImpressionTracker {
   private onFocusChange(focused: boolean) {
     if (focused) {
       this.lastVisibleStart = Date.now();
+      if (!this.qualified) this.scheduleCheck();
     } else {
       this.flush();
     }
@@ -110,10 +135,7 @@ export class ImpressionTracker {
     const count = storedDayTs === dayStart ? Number(localStorage.getItem(DAY_COUNT_KEY) ?? 0) : 0;
     if (count >= MAX_PER_DAY) return false;
 
-    const lastImp = Number(localStorage.getItem(LAST_IMP_KEY) ?? 0);
-    if (now - lastImp < MIN_INTERVAL_MS) return false;
-
-    return true;
+    return !this.inCooldown();
   }
 
   private recordImpression() {

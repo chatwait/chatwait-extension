@@ -1,4 +1,5 @@
 import type { AdCreative } from '../entrypoints/content/adapters/types';
+import { isServePoolExhausted, type AdServeHistory } from './ad-selection';
 
 const KEYS = {
   deviceId: 'chatwait_device_id',
@@ -10,14 +11,22 @@ const KEYS = {
   profileComplete: 'chatwait_profile_complete',
   deviceToken: 'chatwait_device_token',
   lastShownAd: 'chatwait_last_shown_ad',
+  adServeHistory: 'chatwait_ad_serve_history',
+  adBatchState: 'chatwait_ad_batch_state',
 } as const;
 
 /** How long a remembered last-shown ad stays reusable. Generous versus the 60s impression
  * pacing window it serves (see shared.ts), but a hard bound so a stale creative (or its
  * ad_token) can never be resurrected long after it was served. */
 const LAST_SHOWN_AD_TTL_MS = 10 * 60 * 1000;
+const MAX_AD_SERVE_HISTORY_ENTRIES = 500;
 
 type LastShownAdMap = Record<string, { ad: AdCreative; ts: number }>;
+interface AdBatchState {
+  generationId: string;
+  consumedAdIds: string[];
+  exhausted: boolean;
+}
 
 export const storage = {
   async initDeviceId(): Promise<string> {
@@ -33,7 +42,17 @@ export const storage = {
   },
 
   async setAdBundle(bundle: AdCreative[]): Promise<void> {
-    await set(KEYS.adBundle, bundle);
+    const state: AdBatchState = {
+      generationId: crypto.randomUUID(),
+      consumedAdIds: [],
+      exhausted: false,
+    };
+    // One storage write keeps the new bundle and its fresh consumption state in sync for
+    // readers across every supported-site tab.
+    await browser.storage.local.set({
+      [KEYS.adBundle]: bundle,
+      [KEYS.adBatchState]: state,
+    });
   },
 
   async getAdBundle(): Promise<AdCreative[]> {
@@ -45,6 +64,36 @@ export const storage = {
    * every attempt so far has failed), which is worth telling a tester apart from a real bundle. */
   async hasFetchedAdBundle(): Promise<boolean> {
     return (await get<AdCreative[]>(KEYS.adBundle)) !== null;
+  },
+
+  async getAdBatch(): Promise<{ bundle: AdCreative[]; state: AdBatchState | null }> {
+    const result = await browser.storage.local.get([KEYS.adBundle, KEYS.adBatchState]);
+    const storedBundle = (result[KEYS.adBundle] as AdCreative[] | undefined) ?? null;
+    return {
+      bundle: storedBundle ?? HOUSE_AD_BUNDLE,
+      // A missing state means this is either the built-in fallback or a cache written by an
+      // older extension version. Both remain serveable; the next successful refresh creates
+      // a tracked generation.
+      state: (result[KEYS.adBatchState] as AdBatchState | undefined) ?? null,
+    };
+  },
+
+  /** Marks one ad used in the current fetched generation. Returns true exactly once, when
+   * this serve consumes the final ad in the selectable pool and should trigger a refresh. */
+  async markAdBatchConsumed(
+    generationId: string | undefined,
+    adId: string,
+    selectableAds: AdCreative[],
+  ): Promise<boolean> {
+    if (!generationId) return false;
+    const state = await get<AdBatchState>(KEYS.adBatchState);
+    if (!state || state.generationId !== generationId) return false;
+
+    const wasExhausted = state.exhausted;
+    if (!state.consumedAdIds.includes(adId)) state.consumedAdIds.push(adId);
+    state.exhausted = isServePoolExhausted(state.consumedAdIds, selectableAds);
+    await set(KEYS.adBatchState, state);
+    return !wasExhausted && state.exhausted;
   },
 
   /** Last fetched server-side earnings total — cached for offline display, not accumulated locally. */
@@ -109,6 +158,30 @@ export const storage = {
     const entry = ((await get<LastShownAdMap>(KEYS.lastShownAd)) ?? {})[site];
     if (!entry || Date.now() - entry.ts > LAST_SHOWN_AD_TTL_MS) return null;
     return entry.ad;
+  },
+
+  /** Device-local selection history. This records cards served, not only qualified/billable
+   * impressions, because visual repetition is what the rotation is meant to reduce. */
+  async getAdServeHistory(): Promise<AdServeHistory> {
+    return (await get<AdServeHistory>(KEYS.adServeHistory)) ?? {};
+  },
+
+  async recordAdServed(adId: string, servedAt = Date.now()): Promise<void> {
+    const history = await storage.getAdServeHistory();
+    const previous = history[adId];
+    history[adId] = {
+      lastServedAt: servedAt,
+      serveCount: (previous?.serveCount ?? 0) + 1,
+    };
+
+    const ids = Object.keys(history);
+    if (ids.length > MAX_AD_SERVE_HISTORY_ENTRIES) {
+      ids
+        .sort((a, b) => history[b].lastServedAt - history[a].lastServedAt)
+        .slice(MAX_AD_SERVE_HISTORY_ENTRIES)
+        .forEach((id) => delete history[id]);
+    }
+    await set(KEYS.adServeHistory, history);
   },
 
   /** Signed proof the device_id was linked via real Google sign-in; attached to every event. */

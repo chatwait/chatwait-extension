@@ -2,6 +2,7 @@ import { storage } from '../lib/storage';
 import { ApiStatusError, fetchAdBundle, fetchDeviceLinked } from '../lib/api';
 import { flushQueue, startEventFlusher } from '../lib/schedule';
 import { log } from '../lib/log';
+import { chooseAdByServeHistory } from '../lib/ad-selection';
 
 const AD_BUNDLE_INTERVAL_MS = 15 * 60 * 1000;
 // Adaptive sign-in poll: a signed-out device is actively waiting for its sign-in to land,
@@ -27,6 +28,8 @@ const ONBOARDING_AD = {
 // device_ids upsert, so it's a reliable "linked now" signal instead of waiting
 // out the 60s poll.
 const signinTabIds = new Set<number>();
+let adSelectionQueue: Promise<void> = Promise.resolve();
+let adBundleRefreshInFlight: Promise<void> | null = null;
 
 export default defineBackground(() => {
   log.info('build', browser.runtime.getManifest().version_name);
@@ -65,29 +68,14 @@ export default defineBackground(() => {
       // directly in the host page's own DevTools console, instead of a tester needing to dig
       // up the background service worker's console (which MV3 aggressively suspends, so it's
       // often already gone by the time someone opens it after the fact).
-      storage.getSignedIn().then((signedIn) => {
-        if (!signedIn) {
-          log.info('GET_AD: no ad, device is not signed in');
-          return sendResponse({ ad: null, reason: 'not_signed_in' });
-        }
-        Promise.all([storage.getAdBundle(), storage.getProfileComplete()]).then(([bundle, profileComplete]) => {
-          // Pick randomly among the non-house ads (paid campaigns) so repeat viewers don't
-          // always see the single highest bidder; only fall back to the house ad pool when
-          // no paid campaign is in the bundle at all.
-          const nonHouse = bundle.filter((ad) => !ad.is_house_ad);
-          const pool = nonHouse.length > 0 ? nonHouse : bundle;
-          const top = pool.length > 0 ? pool[Math.floor(Math.random() * pool.length)] : null;
-          if (!top) {
-            log.warn('GET_AD: cached ad bundle is empty (never fetched, or last fetch failed)');
-          }
-          if (!profileComplete && (!top || top.is_house_ad)) {
-            log.info('GET_AD: showing onboarding ad (profile incomplete)');
-            return sendResponse({ ad: ONBOARDING_AD, reason: 'onboarding' });
-          }
-          log.info(top ? `GET_AD: serving cached ad ${top.id}` : 'GET_AD: no ad to serve');
-          sendResponse({ ad: top, reason: top ? 'ok' : 'no_bundle' });
+      // Serialize selection across tabs. Without this, two simultaneous GET_AD requests can
+      // both read the same history and choose the same unseen ad before either write lands.
+      enqueueAdSelection(resolveAdRequest)
+        .then(sendResponse)
+        .catch((err) => {
+          log.warn('GET_AD: selection failed', err);
+          sendResponse({ ad: null, reason: 'no_bundle' });
         });
-      });
       return true;
     }
     if (message.type === 'REFRESH_ADS') {
@@ -106,7 +94,12 @@ export default defineBackground(() => {
       }
       Promise.all([storage.getDeviceId(), storage.getDeviceToken()])
         .then(([deviceId, deviceToken]) =>
-          storage.enqueueEvent({ ...message.payload, device_id: deviceId, device_token: deviceToken }),
+          storage.enqueueEvent({
+            ...message.payload,
+            device_id: deviceId,
+            device_token: deviceToken,
+            extension_version: browser.runtime.getManifest().version_name ?? '',
+          }),
         )
         .then(() => flushQueue())
         .then(() => sendResponse({ ok: true }));
@@ -129,6 +122,67 @@ export default defineBackground(() => {
 
   init();
 });
+
+function enqueueAdSelection<T>(select: () => Promise<T>): Promise<T> {
+  const result = adSelectionQueue.then(select, select);
+  adSelectionQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+async function resolveAdRequest() {
+  // If another tab, the 15-minute timer, or batch exhaustion already started a refresh,
+  // wait for that single shared request before selecting. On failure refreshAdBundle keeps
+  // the old cache, so this naturally falls back to the exhausted bundle rather than hiding
+  // the ad or retry-looping.
+  if (adBundleRefreshInFlight) await adBundleRefreshInFlight;
+
+  if (!(await storage.getSignedIn())) {
+    log.info('GET_AD: no ad, device is not signed in');
+    return { ad: null, reason: 'not_signed_in' };
+  }
+
+  const [{ bundle, state }, profileComplete, history] = await Promise.all([
+    storage.getAdBatch(),
+    storage.getProfileComplete(),
+    storage.getAdServeHistory(),
+  ]);
+
+  // Paid campaigns retain priority over house inventory. Within that pool, exhaust unseen
+  // campaigns before rotating to the least-recently-served one, taking them in the server's
+  // ranked bundle order (highest bidder first) rather than at random.
+  const nonHouse = bundle.filter((ad) => !ad.is_house_ad);
+  const pool = nonHouse.length > 0 ? nonHouse : bundle;
+  const selected = chooseAdByServeHistory(pool, history);
+
+  if (!selected) {
+    log.warn('GET_AD: cached ad bundle is empty (never fetched, or last fetch failed)');
+  }
+  if (!profileComplete && (!selected || selected.is_house_ad)) {
+    log.info('GET_AD: showing onboarding ad (profile incomplete)');
+    return { ad: ONBOARDING_AD, reason: 'onboarding' };
+  }
+  if (selected) {
+    await storage.recordAdServed(selected.id);
+    const exhausted = await storage.markAdBatchConsumed(
+      state?.generationId,
+      selected.id,
+      pool,
+    );
+    log.info(`GET_AD: serving cached ad ${selected.id}`);
+    if (exhausted) {
+      log.info(`GET_AD: all ${pool.length} selectable cached ad(s) used, refreshing bundle`);
+      // Do not hold the final ad back while the network request runs. A subsequent GET_AD
+      // waits on this guarded promise above; failures leave the old bundle safely reusable.
+      void refreshAdBundle();
+    }
+  } else {
+    log.info('GET_AD: no ad to serve');
+  }
+  return { ad: selected, reason: selected ? 'ok' : 'no_bundle' };
+}
 
 async function init() {
   await storage.initDeviceId();
@@ -155,7 +209,17 @@ function scheduleNextSignInCheck(signedIn: boolean) {
   );
 }
 
-async function refreshAdBundle(allowAuthRetry = true) {
+function refreshAdBundle(allowAuthRetry = true): Promise<void> {
+  if (adBundleRefreshInFlight) return adBundleRefreshInFlight;
+
+  const refresh = refreshAdBundleOnce(allowAuthRetry).finally(() => {
+    if (adBundleRefreshInFlight === refresh) adBundleRefreshInFlight = null;
+  });
+  adBundleRefreshInFlight = refresh;
+  return refresh;
+}
+
+async function refreshAdBundleOnce(allowAuthRetry = true) {
   try {
     const [deviceId, deviceToken] = await Promise.all([storage.getDeviceId(), storage.getDeviceToken()]);
     if (!deviceId || !deviceToken) {
@@ -177,7 +241,7 @@ async function refreshAdBundle(allowAuthRetry = true) {
     if (allowAuthRetry && err instanceof ApiStatusError && err.status === 401) {
       log.warn('ad bundle fetch unauthorized (401): re-checking sign-in status now');
       const linked = await refreshSignInStatus();
-      if (linked) await refreshAdBundle(false);
+      if (linked) await refreshAdBundleOnce(false);
       return;
     }
     // keep serving cached bundle on network error

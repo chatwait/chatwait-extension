@@ -10,9 +10,11 @@ const KEYS = {
   signedIn: 'chatwait_signed_in',
   profileComplete: 'chatwait_profile_complete',
   deviceToken: 'chatwait_device_token',
+  installationHeartbeatAt: 'chatwait_installation_heartbeat_at',
   lastShownAd: 'chatwait_last_shown_ad',
   adServeHistory: 'chatwait_ad_serve_history',
   adBatchState: 'chatwait_ad_batch_state',
+  adDedupState: 'chatwait_ad_dedup_state',
 } as const;
 
 /** How long a remembered last-shown ad stays reusable. Generous versus the 60s impression
@@ -20,13 +22,36 @@ const KEYS = {
  * ad_token) can never be resurrected long after it was served. */
 const LAST_SHOWN_AD_TTL_MS = 10 * 60 * 1000;
 const MAX_AD_SERVE_HISTORY_ENTRIES = 500;
+const INSTALLATION_HEARTBEAT_INTERVAL_MS = 12 * 60 * 60 * 1000;
+
+/** How long a qualified impression locks its ad out of local re-selection --
+ * T-20260804-1411-response-gated-ad-exclusion. Deliberately a flat client-side constant
+ * rather than something server-derived: matches `campaigns.freq_min_gap_minutes` for the
+ * three freq-capped campaigns (083_campaign_frequency_cap.sql), which is the longest legitimate
+ * re-serve gap in use, so this can never falsely block a repeat that the server would actually
+ * allow. Needs to be bumped by hand if any campaign's configured gap ever exceeds it. */
+const AD_EXCLUDE_TTL_MS = 30 * 60 * 1000;
 
 type LastShownAdMap = Record<string, { ad: AdCreative; ts: number }>;
 interface AdBatchState {
   generationId: string;
   consumedAdIds: string[];
   exhausted: boolean;
+  /** Separate from `exhausted` above (which tracks the serve-history rotation) -- set once a
+   * refresh has already been triggered because every ad in the pool was locked out by the
+   * dedup state, so repeat GET_AD calls while still locked don't each kick off their own fetch. */
+  dedupExhaustedRefreshTriggered: boolean;
 }
+
+/** An ad's local dedup lock. 'pending' = impression sent, server outcome not yet known;
+ * 'excluded' = confirmed (or assumed, via self-heal) spent for the rest of the TTL window.
+ * Both statuses block re-selection identically (see filterAvailableAds) -- the distinction
+ * only matters for how resolveRecordedAds treats presence/absence in a flush response. */
+interface AdDedupEntry {
+  status: 'pending' | 'excluded';
+  since: number;
+}
+type AdDedupState = Record<string, AdDedupEntry>;
 
 export const storage = {
   async initDeviceId(): Promise<string> {
@@ -46,6 +71,7 @@ export const storage = {
       generationId: crypto.randomUUID(),
       consumedAdIds: [],
       exhausted: false,
+      dedupExhaustedRefreshTriggered: false,
     };
     // One storage write keeps the new bundle and its fresh consumption state in sync for
     // readers across every supported-site tab.
@@ -94,6 +120,60 @@ export const storage = {
     state.exhausted = isServePoolExhausted(state.consumedAdIds, selectableAds);
     await set(KEYS.adBatchState, state);
     return !wasExhausted && state.exhausted;
+  },
+
+  /** Same one-shot-per-generation shape as markAdBatchConsumed above, for the other reason a
+   * refresh might be worth triggering: every ad in the pool is currently dedup-locked (see
+   * filterAvailableAds), independent of whether the serve-history rotation considers it
+   * exhausted. Returns true only the first time this is observed for a given generation. */
+  async markDedupExhaustionRefreshTriggered(generationId: string | undefined): Promise<boolean> {
+    if (!generationId) return false;
+    const state = await get<AdBatchState>(KEYS.adBatchState);
+    if (!state || state.generationId !== generationId) return false;
+    if (state.dedupExhaustedRefreshTriggered) return false;
+    state.dedupExhaustedRefreshTriggered = true;
+    await set(KEYS.adBatchState, state);
+    return true;
+  },
+
+  /** Locks an ad out of local re-selection the instant its impression qualifies (before any
+   * network activity) -- the zero-race guard in T-20260804-1411-response-gated-ad-exclusion.
+   * Extension-global (browser.storage, not page localStorage) so it's visible to every tab
+   * across every site, not just the one that qualified it. */
+  async markAdPending(adId: string, now = Date.now()): Promise<void> {
+    const state = pruneAdDedupState((await get<AdDedupState>(KEYS.adDedupState)) ?? {}, now);
+    state[adId] = { status: 'pending', since: now };
+    await set(KEYS.adDedupState, state);
+  },
+
+  /** Resolves the outcome of a flush: any ad_id present here got an impressions row written
+   * server-side (billable or a recorded non-billable duplicate/cap/race -- see
+   * events/index.ts), so it's locked out for the rest of the TTL window regardless of which.
+   * ad_ids absent from a successful flush are left alone deliberately -- see markAdPending's
+   * self-heal note in filterAvailableAds for why absence isn't treated as "safe to retry now". */
+  async resolveRecordedAds(adIds: string[], now = Date.now()): Promise<void> {
+    if (adIds.length === 0) return;
+    const state = pruneAdDedupState((await get<AdDedupState>(KEYS.adDedupState)) ?? {}, now);
+    for (const id of adIds) {
+      if (state[id]?.status === 'pending') state[id] = { status: 'excluded', since: now };
+    }
+    await set(KEYS.adDedupState, state);
+  },
+
+  /** Filters out ads currently locked by the dedup state: still 'pending' (outcome unknown --
+   * conservatively treated the same as excluded) or 'excluded' and within the TTL window.
+   * Self-heals a pending entry whose flush response never correlated (event lost, or the
+   * server rejected it for a reason unrelated to this ad) by expiring it at the same TTL as a
+   * confirmed exclusion, rather than leaving it locked forever on an unknown outcome. House
+   * ads are never filtered -- select_ad_bundle's house fallback has no dedup condition, and
+   * repeating one is the intended filler behavior, not something worth a local lock. */
+  async filterAvailableAds(ads: AdCreative[], now = Date.now()): Promise<AdCreative[]> {
+    const state = (await get<AdDedupState>(KEYS.adDedupState)) ?? {};
+    return ads.filter((ad) => {
+      if (ad.is_house_ad) return true;
+      const entry = state[ad.id];
+      return !entry || now - entry.since > AD_EXCLUDE_TTL_MS;
+    });
   },
 
   /** Last fetched server-side earnings total — cached for offline display, not accumulated locally. */
@@ -195,6 +275,17 @@ export const storage = {
     if (token) await set(KEYS.deviceToken, token);
     else await remove(KEYS.deviceToken);
   },
+
+  /** Limits installation last-seen writes while still giving uninstall-rate analysis a
+   * useful active/inactive signal. A missing value makes the first startup immediately due. */
+  async isInstallationHeartbeatDue(now = Date.now()): Promise<boolean> {
+    const last = await get<number>(KEYS.installationHeartbeatAt);
+    return !last || now - last >= INSTALLATION_HEARTBEAT_INTERVAL_MS;
+  },
+
+  async markInstallationHeartbeat(now = Date.now()): Promise<void> {
+    await set(KEYS.installationHeartbeatAt, now);
+  },
 };
 
 async function get<T>(key: string): Promise<T | null> {
@@ -208,6 +299,17 @@ async function set(key: string, value: unknown): Promise<void> {
 
 async function remove(key: string): Promise<void> {
   await browser.storage.local.remove(key);
+}
+
+/** Drops entries past the TTL on every write so chatwait_ad_dedup_state doesn't grow
+ * unbounded across a long-running install -- unlike adBatchState this isn't reset on every
+ * bundle refresh (it has to survive across refreshes to actually cover the 30-minute window). */
+function pruneAdDedupState(state: AdDedupState, now: number): AdDedupState {
+  const pruned: AdDedupState = {};
+  for (const [id, entry] of Object.entries(state)) {
+    if (now - entry.since <= AD_EXCLUDE_TTL_MS) pruned[id] = entry;
+  }
+  return pruned;
 }
 
 const HOUSE_AD_BUNDLE: AdCreative[] = [

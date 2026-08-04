@@ -14,6 +14,14 @@ function extensionVersion(): string {
   }
 }
 
+function browserName(): 'chrome' | 'firefox' | 'edge' | 'other' {
+  const ua = typeof navigator === 'undefined' ? '' : navigator.userAgent;
+  if (/Firefox\//i.test(ua)) return 'firefox';
+  if (/Edg\//i.test(ua)) return 'edge';
+  if (/Chrome\//i.test(ua)) return 'chrome';
+  return 'other';
+}
+
 /** Non-2xx API response. Carries the HTTP status so callers can react to specific codes
  * (the background treats a 401 from ads-bundle as "re-check sign-in now") instead of
  * pattern-matching error message strings. */
@@ -36,25 +44,50 @@ export async function fetchAdBundle(deviceId: string, deviceToken: string): Prom
   return data.ads ?? [];
 }
 
-export async function sendEvents(events: object[]): Promise<void> {
-  if (events.length === 0) return;
+/** `results`: ad_ids that got an impressions row written this batch -- see
+ * T-20260804-1411-response-gated-ad-exclusion. Used by the caller to resolve local dedup
+ * locks; deliberately just an ad_id list, nothing more, so a malformed/older backend response
+ * (missing the field) degrades to "nothing resolved" rather than throwing. */
+export async function sendEvents(events: object[]): Promise<{ results: string[] }> {
+  if (events.length === 0) return { results: [] };
   const res = await fetch(`${BASE_URL}/events`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ events }),
   });
   if (!res.ok) throw new Error(`sendEvents: ${res.status}`);
+  const data = await res.json();
+  return { results: Array.isArray(data?.results) ? data.results : [] };
 }
 
 export async function fetchDeviceLinked(
   deviceId: string,
-): Promise<{ linked: boolean; profileComplete: boolean; deviceToken?: string }> {
+  installationHeartbeat = false,
+): Promise<{
+  linked: boolean;
+  profileComplete: boolean;
+  deviceToken?: string;
+  uninstallToken?: string;
+  installationTracked: boolean;
+}> {
+  const params = new URLSearchParams({
+    device_id: deviceId,
+    extension_version: extensionVersion(),
+    browser: browserName(),
+  });
+  if (installationHeartbeat) params.set('installation_heartbeat', '1');
   const res = await fetch(
-    `${BASE_URL}/device-status?device_id=${deviceId}&extension_version=${encodeURIComponent(extensionVersion())}`,
+    `${BASE_URL}/device-status?${params}`,
   );
   if (!res.ok) throw new Error(`fetchDeviceLinked: ${res.status}`);
   const data = await res.json();
-  return { linked: !!data.linked, profileComplete: !!data.profile_complete, deviceToken: data.device_token };
+  return {
+    linked: !!data.linked,
+    profileComplete: !!data.profile_complete,
+    deviceToken: data.device_token,
+    uninstallToken: data.uninstall_token,
+    installationTracked: data.installation_tracked !== false,
+  };
 }
 
 export async function fetchEarnings(deviceId: string, deviceToken: string): Promise<number> {

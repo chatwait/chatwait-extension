@@ -1,9 +1,13 @@
 import type { PromptAdapter, PromptCallbacks } from './types';
 
-// Verified 2026-06-12 against live chatgpt.com
-const SEND_BTN  = '[data-testid="send-button"]';
-const COMPOSER  = '#prompt-textarea';
-export const USER_MSG  = '[data-message-author-role="user"]';
+// Verified 2026-06-12 against live chatgpt.com (classic app, signed-in threads).
+// Signed-out visitors (confirmed live 2026-08-01) get a completely different, lighter-weight
+// "wm-app" composer/thread UI with none of these hooks — CSS module class names there are
+// build-hashed (e.g. `_wdUoQG_userMessage`) and unusable as selectors, but it exposes its own
+// stable `data-*` attributes, so both surfaces are matched in parallel rather than picking one.
+const SEND_BTN  = '[data-testid="send-button"], button[data-composer-submit]';
+const COMPOSER  = '#prompt-textarea, [data-mobile-composer-prompt]';
+export const USER_MSG  = '[data-message-author-role="user"], [data-user-message-bubble]';
 
 // Long/old threads get virtualized: ChatGPT unmounts older user messages from the DOM as new
 // ones are appended, so a raw count of matches can legitimately go up, down, or stay flat
@@ -12,14 +16,17 @@ export const USER_MSG  = '[data-message-author-role="user"]';
 // one, so even comparing trailing-element identity isn't reliable on a virtualized thread: the
 // "new" last element can literally be the same object as the old one, just repositioned with
 // updated content. `data-message-id` is a stable per-message UUID that survives node reuse
-// (confirmed present on every real user message), so key off that instead of the node itself.
+// (confirmed present on every real user message in the classic app). The wm-app surface has no
+// such attribute on the message node itself, but its ancestor `<li>` (the message "turn") carries
+// the same kind of stable per-message UUID as its `id`, so fall back to that.
 function lastOf(list: NodeListOf<HTMLElement>): HTMLElement | null {
   return list.length ? list[list.length - 1] : null;
 }
 
 function lastMsgKey(list: NodeListOf<HTMLElement>): string | HTMLElement | null {
   const el = lastOf(list);
-  return el ? (el.getAttribute('data-message-id') ?? el) : null;
+  if (!el) return null;
+  return el.getAttribute('data-message-id') ?? el.closest('li[id]')?.id ?? el;
 }
 
 export class ChatGPTAdapter implements PromptAdapter {
@@ -119,14 +126,29 @@ export class ChatGPTAdapter implements PromptAdapter {
 
   private watchForDone() {
     this.doneObserver?.disconnect();
-    // Send button disappears during generation; reappearing signals completion
+    // Classic app: send button disappears during generation; reappearing (not disabled) signals
+    // completion. wm-app (signed-out): the button never disappears or disables during generation
+    // — it stays enabled and swaps `type`/`aria-label` to a "Stop generating" control instead
+    // (confirmed live: `disabled` stays false throughout streaming) — so `!btn.disabled` alone
+    // would fire immediately on that surface. `data-send-label`/`data-stop-label` mirror the
+    // button's two states regardless of which one is currently live, so comparing against those
+    // works for wm-app without a hardcoded string, and is skipped entirely on the classic app,
+    // which doesn't have the attributes.
     this.doneObserver = new MutationObserver(() => {
       const btn = document.querySelector<HTMLButtonElement>(SEND_BTN);
-      if (btn && !btn.disabled) {
+      if (!btn) return;
+      const sendLabel = btn.getAttribute('data-send-label');
+      const ready = sendLabel ? btn.getAttribute('aria-label') === sendLabel : !btn.disabled;
+      if (ready) {
         this.cb?.onDone();
         this.doneObserver?.disconnect();
       }
     });
-    this.doneObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['disabled'] });
+    this.doneObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['disabled', 'aria-label'],
+    });
   }
 }

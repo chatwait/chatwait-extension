@@ -13,6 +13,7 @@ const AD_BUNDLE_INTERVAL_MS = 15 * 60 * 1000;
 const SIGNIN_CHECK_SIGNED_OUT_MS = 60 * 1000;
 const SIGNIN_CHECK_SIGNED_IN_MS = 30 * 60 * 1000;
 const SIGNIN_URL = 'https://chatwait.com/signin';
+const UNINSTALL_URL = 'https://api.chatwait.com/functions/v1/uninstall';
 
 const ONBOARDING_AD = {
   id: 'onboarding',
@@ -92,7 +93,17 @@ export default defineBackground(() => {
         sendResponse({ ok: true, mock: true });
         return true;
       }
-      Promise.all([storage.getDeviceId(), storage.getDeviceToken()])
+      // Locks the ad out of local re-selection immediately, before any network activity --
+      // the zero-race guard from T-20260804-1411-response-gated-ad-exclusion. Must happen
+      // before enqueue/flush, not after, so a concurrent GET_AD from any tab (any site) can
+      // never re-select this same ad while its outcome is still in flight.
+      const payload = message.payload as { type?: string; ad_id?: string } | undefined;
+      const markPending =
+        payload?.type === 'impression' && typeof payload.ad_id === 'string'
+          ? storage.markAdPending(payload.ad_id)
+          : Promise.resolve();
+      markPending
+        .then(() => Promise.all([storage.getDeviceId(), storage.getDeviceToken()]))
         .then(([deviceId, deviceToken]) =>
           storage.enqueueEvent({
             ...message.payload,
@@ -154,8 +165,22 @@ async function resolveAdRequest() {
   // campaigns before rotating to the least-recently-served one, taking them in the server's
   // ranked bundle order (highest bidder first) rather than at random.
   const nonHouse = bundle.filter((ad) => !ad.is_house_ad);
-  const pool = nonHouse.length > 0 ? nonHouse : bundle;
-  const selected = chooseAdByServeHistory(pool, history);
+  const rawPool = nonHouse.length > 0 ? nonHouse : bundle;
+  // Excludes ads currently locked by the dedup state (pending an event outcome, or already
+  // confirmed spent) -- see T-20260804-1411-response-gated-ad-exclusion. This is what
+  // actually prevents re-tracking a duplicate; markAdBatchConsumed's exhaustion signal below
+  // is unchanged and still just a serve-history rotation hint.
+  const pool = await storage.filterAvailableAds(rawPool);
+  let selected = chooseAdByServeHistory(pool, history);
+  let dedupLocked = false;
+
+  if (!selected && rawPool.length > 0) {
+    // Every ad in the fetched bundle is currently dedup-locked -- fall back to the house ad
+    // (from the full bundle, not the filtered pool, since filterAvailableAds never excludes
+    // house ads) rather than either repeating a guaranteed-duplicate ad or showing nothing.
+    dedupLocked = true;
+    selected = bundle.find((ad) => ad.is_house_ad) ?? null;
+  }
 
   if (!selected) {
     log.warn('GET_AD: cached ad bundle is empty (never fetched, or last fetch failed)');
@@ -166,14 +191,14 @@ async function resolveAdRequest() {
   }
   if (selected) {
     await storage.recordAdServed(selected.id);
-    const exhausted = await storage.markAdBatchConsumed(
-      state?.generationId,
-      selected.id,
-      pool,
-    );
+    const shouldRefresh = dedupLocked
+      ? await storage.markDedupExhaustionRefreshTriggered(state?.generationId)
+      : await storage.markAdBatchConsumed(state?.generationId, selected.id, rawPool);
     log.info(`GET_AD: serving cached ad ${selected.id}`);
-    if (exhausted) {
-      log.info(`GET_AD: all ${pool.length} selectable cached ad(s) used, refreshing bundle`);
+    if (shouldRefresh) {
+      log.info(
+        `GET_AD: refreshing bundle (${dedupLocked ? 'dedup-locked' : `all ${rawPool.length} selectable cached ad(s) used`})`,
+      );
       // Do not hold the final ad back while the network request runs. A subsequent GET_AD
       // waits on this guarded promise above; failures leave the old bundle safely reusable.
       void refreshAdBundle();
@@ -263,7 +288,14 @@ async function checkSignInStatus(): Promise<boolean> {
   const deviceId = await storage.getDeviceId();
   if (!deviceId) return false;
   try {
-    const { linked, profileComplete, deviceToken } = await fetchDeviceLinked(deviceId);
+    const heartbeatDue = await storage.isInstallationHeartbeatDue();
+    const {
+      linked,
+      profileComplete,
+      deviceToken,
+      uninstallToken,
+      installationTracked,
+    } = await fetchDeviceLinked(deviceId, heartbeatDue);
     // The device id may have changed again while this request was in flight; don't let a
     // slow response for an old id stomp a newer, more current status.
     if ((await storage.getDeviceId()) !== deviceId) return storage.getSignedIn();
@@ -275,6 +307,19 @@ async function checkSignInStatus(): Promise<boolean> {
     await storage.setDeviceToken(deviceToken);
     await storage.setSignedIn(linked);
     await storage.setProfileComplete(profileComplete);
+    if (uninstallToken) {
+      // setUninstallURL needs no manifest permission. The endpoint records first and then
+      // redirects to the optional survey, so closing that tab cannot lose the event.
+      try {
+        await browser.runtime.setUninstallURL(
+          `${UNINSTALL_URL}?token=${encodeURIComponent(uninstallToken)}`,
+        );
+      } catch (err) {
+        // Analytics must never make sign-in or ad serving fail on an unsupported browser.
+        log.warn('could not set uninstall URL', err);
+      }
+    }
+    if (heartbeatDue && installationTracked) await storage.markInstallationHeartbeat();
     if (!hadToken && deviceToken) {
       // First time this device gets its token (just signed in): the cached bundle was fetched
       // unauthenticated and its ads carry no ad_tokens, so impressions from it can't bill.

@@ -9,75 +9,107 @@ function iconSrc(ad: AdCreative): string | undefined {
   return undefined;
 }
 
-const CARD_HTML = (ad: AdCreative) => `
-  <style>
-    :host { all: initial; }
-    .row {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 12px 2px;
-      margin: 4px 0;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      font-size: 16px;
-      line-height: 1.45;
-      border-bottom: 1px solid rgba(127,127,142,0.22);
-    }
-    .icon {
-      flex-shrink: 0;
-      width: 20px;
-      height: 20px;
-      border-radius: 4px;
-      background: #2563eb;
-      color: #fff;
-      font-size: 11px;
-      font-weight: 700;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      text-transform: uppercase;
-    }
-    .icon.house { background: #10b981; }
-    .icon.has-img { background: transparent; }
-    .icon img { width: 100%; height: 100%; object-fit: cover; display: block; }
-    .text { flex: 1; min-width: 0; color: rgba(60,60,67,0.85); }
-    .text a { color: #2563eb; text-decoration: none; font-weight: 500; }
-    .text a:hover { text-decoration: underline; }
-    .dismiss {
-      background: none;
-      border: none;
-      color: rgba(60,60,67,0.4);
-      cursor: pointer;
-      font-size: 15px;
-      line-height: 1;
-      padding: 2px 4px;
-      border-radius: 6px;
-      flex-shrink: 0;
-      opacity: 0;
-      transition: opacity 0.1s ease;
-    }
-    .row:hover .dismiss, .dismiss:focus-visible { opacity: 1; }
-    .dismiss:hover { color: rgba(60,60,67,0.75); background: rgba(127,127,142,0.12); }
+// Static CSS text (no advertiser-supplied data ever goes into this string), assigned to a
+// <style> element's textContent below — not an innerHTML sink, so AMO's linter has nothing
+// to flag. Every other node in the card is built with document.createElement/appendChild,
+// and ad-supplied fields (text, sponsor_name, url, icon_url) are set via textContent/href/src,
+// never parsed as markup, so a malicious creative (self-serve advertiser input) can't inject
+// markup into a page running as a content script on chatgpt.com/claude.ai/gemini.google.com.
+const CARD_CSS = `
+  :host { all: initial; }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 2px;
+    margin: 4px 0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 16px;
+    line-height: 1.45;
+    border-bottom: 1px solid rgba(127,127,142,0.22);
+  }
+  .icon {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    border-radius: 4px;
+    background: #2563eb;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-transform: uppercase;
+  }
+  .icon.house { background: #10b981; }
+  .icon.has-img { background: transparent; }
+  .icon img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .text { flex: 1; min-width: 0; color: rgba(60,60,67,0.85); }
+  .text a { color: #2563eb; text-decoration: none; font-weight: 500; }
+  .text a:hover { text-decoration: underline; }
+  .dismiss {
+    background: none;
+    border: none;
+    color: rgba(60,60,67,0.4);
+    cursor: pointer;
+    font-size: 15px;
+    line-height: 1;
+    padding: 2px 4px;
+    border-radius: 6px;
+    flex-shrink: 0;
+    opacity: 0;
+    transition: opacity 0.1s ease;
+  }
+  .row:hover .dismiss, .dismiss:focus-visible { opacity: 1; }
+  .dismiss:hover { color: rgba(60,60,67,0.75); background: rgba(127,127,142,0.12); }
 
-    @media (prefers-color-scheme: dark) {
-      .text { color: #d4d4d8; }
-      .text a { color: #60a5fa; }
-      .dismiss { color: #71717a; }
-      .dismiss:hover { color: #d4d4d8; }
-    }
-  </style>
-  <div class="row">
-    <span class="icon${ad.is_house_ad || ad.kind === "onboarding" ? " house" : ""}${iconSrc(ad) ? " has-img" : ""}">${
-      iconSrc(ad)
-        ? `<img src="${iconSrc(ad)!.replace(/"/g, "&quot;")}" alt="" referrerpolicy="no-referrer">`
-        : ad.sponsor_name.slice(0, 1)
-    }</span>
-    <span class="text">
-      <a href="${ad.url}" target="_blank" rel="noopener noreferrer">${ad.text}</a>
-    </span>
-    <button class="dismiss" aria-label="Dismiss ad">×</button>
-  </div>
+  @media (prefers-color-scheme: dark) {
+    .text { color: #d4d4d8; }
+    .text a { color: #60a5fa; }
+    .dismiss { color: #71717a; }
+    .dismiss:hover { color: #d4d4d8; }
+  }
 `;
+
+/** Builds the card's static DOM skeleton (style + row + icon/text/dismiss slots), with no
+ * advertiser data in it yet — `show()` fills in the ad-specific fields afterward. */
+function buildCardSkeleton(): {
+  fragment: DocumentFragment;
+  iconEl: HTMLElement;
+  anchor: HTMLAnchorElement;
+  dismissEl: HTMLButtonElement;
+} {
+  const fragment = document.createDocumentFragment();
+
+  const style = document.createElement("style");
+  style.textContent = CARD_CSS;
+  fragment.appendChild(style);
+
+  const row = document.createElement("div");
+  row.className = "row";
+
+  const iconEl = document.createElement("span");
+  iconEl.className = "icon";
+  row.appendChild(iconEl);
+
+  const text = document.createElement("span");
+  text.className = "text";
+  const anchor = document.createElement("a");
+  anchor.target = "_blank";
+  anchor.rel = "noopener noreferrer";
+  text.appendChild(anchor);
+  row.appendChild(text);
+
+  const dismissEl = document.createElement("button");
+  dismissEl.className = "dismiss";
+  dismissEl.setAttribute("aria-label", "Dismiss ad");
+  dismissEl.textContent = "×";
+  row.appendChild(dismissEl);
+
+  fragment.appendChild(row);
+  return { fragment, iconEl, anchor, dismissEl };
+}
 
 export class AdCard {
   private host: HTMLElement | null = null;
@@ -107,25 +139,37 @@ export class AdCard {
     this.host.style.display = "block";
     this.host.style.width = "100%";
     const root = this.host.attachShadow({ mode: "closed" });
-    root.innerHTML = CARD_HTML(ad);
-    // If the icon image fails to load (network error, or the host page's CSP blocks
-    // the external <img>), fall back to the sponsor-initial letter tile.
-    if (iconSrc(ad)) {
-      const iconEl = root.querySelector(".icon")!;
-      const img = iconEl.querySelector("img");
-      img?.addEventListener("error", () => {
+    const { fragment, iconEl, anchor, dismissEl } = buildCardSkeleton();
+    root.appendChild(fragment);
+
+    const isHouse = ad.is_house_ad || ad.kind === "onboarding";
+    const src = iconSrc(ad);
+    iconEl.classList.toggle("house", !!isHouse);
+    if (src) {
+      iconEl.classList.add("has-img");
+      const img = document.createElement("img");
+      img.src = src;
+      img.alt = "";
+      img.referrerPolicy = "no-referrer";
+      // If the icon image fails to load (network error, or the host page's CSP blocks
+      // the external <img>), fall back to the sponsor-initial letter tile.
+      img.addEventListener("error", () => {
         iconEl.classList.remove("has-img");
         iconEl.textContent = ad.sponsor_name.slice(0, 1);
       });
+      iconEl.appendChild(img);
+    } else {
+      iconEl.textContent = ad.sponsor_name.slice(0, 1);
     }
-    root
-      .querySelector(".dismiss")!
-      .addEventListener("click", () => {
-        this.dismiss();
-        opts?.onDismiss?.();
-      });
+
+    anchor.href = ad.url;
+    anchor.textContent = ad.text;
+
+    dismissEl.addEventListener("click", () => {
+      this.dismiss();
+      opts?.onDismiss?.();
+    });
     if (opts?.onClick) {
-      const anchor = root.querySelector(".text a") as HTMLAnchorElement;
       anchor.addEventListener("click", () => opts.onClick!(anchor));
     }
     afterEl.after(this.host);

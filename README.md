@@ -25,15 +25,22 @@ Chatwait isn't in the Chrome Web Store yet, so for now you install it as an unpa
 
 ## Build from Source
 
+Requirements: Node.js 20 or newer (built and tested with Node v22.19.0) and pnpm (built
+and tested with 10.17.1). No OS-specific build steps; builds cleanly on macOS, Linux, and
+Windows. Install pnpm via `corepack enable` (bundled with Node 16.13+) or `npm install -g pnpm`.
+
 ```bash
 pnpm install
-pnpm build
+pnpm build          # Chrome/Chromium, output in .output/chrome-mv3/
+pnpm build:firefox  # Firefox, output in .output/firefox-mv2/
 ```
 
-`pnpm dev` starts WXT development mode when WXT can allocate a local dev-server port.
+`pnpm dev` / `pnpm dev:firefox` start WXT development mode when WXT can allocate a local
+dev-server port.
 
 ### Install Build
 
+**Chrome/Chromium:**
 1. Run `pnpm build`.
 2. Open `chrome://extensions`.
 3. Enable Developer Mode.
@@ -41,12 +48,19 @@ pnpm build
 5. Select `.output/chrome-mv3`.
 6. Open ChatGPT, Claude, or Gemini and submit a prompt.
 
+**Firefox:**
+1. Run `pnpm build:firefox`.
+2. Open `about:debugging#/runtime/this-firefox`.
+3. Click Load Temporary Add-on.
+4. Select any file inside `.output/firefox-mv2` (e.g. `manifest.json`).
+5. Open ChatGPT, Claude, or Gemini and submit a prompt.
+
 ## How it works
 
 1. The content script detects a prompt submission.
 2. The site adapter waits for the new user-message element.
 3. If no host ad is visible and Chatwait is enabled, the extension injects a sponsored text card after the user message.
-4. A qualified impression requires at least 5 seconds of visible, focused dwell time.
+4. A qualified impression requires a minimum amount of visible, focused dwell time.
 5. The background worker sends qualified events to the Chatwait backend.
 
 ## Permissions

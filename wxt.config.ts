@@ -57,13 +57,20 @@ if (agentMode && !agentChrome) {
   );
 }
 
+// `wxt zip` and `wxt zip -b firefox` both write to the same .output/ directory;
+// give each browser's artifact its own filename so a Firefox build doesn't
+// overwrite (or get confused with) the Chrome Web Store zip.
+const targetBrowser = (() => {
+  const i = process.argv.findIndex((arg) => arg === '-b' || arg === '--browser');
+  if (i !== -1 && process.argv[i + 1]) return process.argv[i + 1];
+  const eq = process.argv.find((arg) => arg.startsWith('--browser='));
+  return eq ? eq.split('=')[1] : 'chrome';
+})();
+
 export default defineConfig({
   zip: {
-    name: 'chatwait-extension',
+    name: targetBrowser === 'chrome' ? 'chatwait-extension' : `chatwait-extension-${targetBrowser}`,
     artifactTemplate: '{{name}}.zip',
-  },
-  suppressWarnings: {
-    firefoxDataCollection: true,
   },
   webExt: agentMode
     ? {
@@ -128,5 +135,28 @@ export default defineConfig({
         matches: ['https://chatgpt.com/*', 'https://claude.ai/*', 'https://gemini.google.com/*'],
       },
     ],
+    // AMO requires every new submission to declare what personal data it collects/transmits
+    // (see PRIVACY.md). browsingActivity (the chatgpt.com/claude.ai/gemini.google.com hostname
+    // on each event) is core to how ads are served, so it's required. technicalAndInteraction
+    // (event type, dwell time, card id) can only ever be declared optional per Mozilla's schema.
+    // personallyIdentifyingInfo (email) is optional because it's only sent if the user chooses
+    // to link an account. Gecko-only key; Chrome ignores browser_specific_settings but there's
+    // no reason to ship it in a manifest Chrome will never read.
+    ...(targetBrowser === 'firefox'
+      ? {
+          browser_specific_settings: {
+            gecko: {
+              // Explicit add-on ID: AMO warns this will become mandatory, and setting it now
+              // pins the extension's ID/update URL across future submissions instead of
+              // letting AMO mint a random one on first upload.
+              id: 'extension@chatwait.com',
+              data_collection_permissions: {
+                required: ['browsingActivity'],
+                optional: ['technicalAndInteraction', 'personallyIdentifyingInfo'],
+              },
+            },
+          },
+        }
+      : {}),
   },
 });

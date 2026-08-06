@@ -1,24 +1,46 @@
 import type { PromptAdapter, PromptCallbacks } from './types';
 
-// Verified 2026-06-12 against live claude.ai; USER_BUBBLE re-verified 2026-07-02
+// Verified 2026-06-12 against live claude.ai; USER_BUBBLE re-verified 2026-08-06 (Claude
+// dropped data-user-message-bubble; replaced with the data-cds="UserMessage" component marker).
+// Claude runs UI experiments, so different accounts can be on different DOM variants at the
+// same time — kept both markers (newest first) instead of swapping one for the other.
 const SEND_BTN = 'button[aria-label="Send message"]';
 const COMPOSER  = '[data-testid="chat-input"]';
 export const USER_MSG  = '[data-testid="user-message"]';
-// [data-testid="user-message"] lives inside the message bubble (the div with
-// data-user-message-bubble, which carries the rounded gray background). Anchoring the card
-// there via afterEl.after() inserted it as a sibling *inside* that bubble's parent chain, so
-// it rendered nested inside the bubble's own background instead of in the dead space below
-// it. USER_BUBBLE's own parentElement is the full-width row wrapper the bubble is centered
-// in — anchoring there instead escapes the bubble.
-const USER_BUBBLE = '[data-user-message-bubble]';
+// [data-testid="user-message"] lives inside the message bubble (a wrapper div carrying the
+// rounded gray background). Anchoring the card there via afterEl.after() inserted it as a
+// sibling *inside* that bubble's parent chain, so it rendered nested inside the bubble's own
+// background instead of in the dead space below it. USER_BUBBLE's own parentElement is the
+// full-width row wrapper the bubble is centered in — anchoring there instead escapes the bubble.
+const USER_BUBBLE_SELECTORS = ['[data-cds="UserMessage"]', '[data-user-message-bubble]'];
+
+// Last-resort fallback when none of USER_BUBBLE_SELECTORS match (an unknown experiment
+// variant): walk up from the message until the bounding box widens sharply, which is what
+// happens when escaping the narrow right-aligned bubble column into the full-width row.
+const WIDEN_RATIO = 1.3;
+const MAX_WALK = 6;
+
+function findByWidening(userMsgEl: HTMLElement): HTMLElement {
+  let el: HTMLElement = userMsgEl;
+  const baseWidth = userMsgEl.getBoundingClientRect().width;
+  for (let i = 0; i < MAX_WALK && el.parentElement; i++) {
+    const parent = el.parentElement;
+    if (parent.getBoundingClientRect().width >= baseWidth * WIDEN_RATIO) return parent;
+    el = parent;
+  }
+  return userMsgEl;
+}
 
 /** Given a matched USER_MSG element, returns the element the ad card should be anchored
  * after — the bubble's parent, escaping its rounded background. Exported so any other
  * caller anchoring off USER_MSG (e.g. the WXT_PREVIEW dev script) applies the same fix
  * instead of re-deriving (and potentially re-breaking) it. */
 export function resolveAnchor(userMsgEl: HTMLElement): HTMLElement {
-  const bubble = userMsgEl.closest<HTMLElement>(USER_BUBBLE);
-  return bubble?.parentElement ?? userMsgEl;
+  for (const sel of USER_BUBBLE_SELECTORS) {
+    const bubble = userMsgEl.closest<HTMLElement>(sel);
+    if (bubble?.parentElement) return bubble.parentElement;
+  }
+  return findByWidening(userMsgEl);
 }
 
 function lastOf(list: NodeListOf<HTMLElement>): HTMLElement | null {

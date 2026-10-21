@@ -64,6 +64,7 @@ export class ChatGPTAdapter implements PromptAdapter {
   private anchorObserver: MutationObserver | null = null;
   private doneObserver: MutationObserver | null = null;
   private reattachObserver: MutationObserver | null = null;
+  private reanchorObserver: MutationObserver | null = null;
   private preSubmitUserMsgKey: string | HTMLElement | null = null;
 
   start(cb: PromptCallbacks) {
@@ -79,6 +80,7 @@ export class ChatGPTAdapter implements PromptAdapter {
     this.reattachObserver?.disconnect();
     this.anchorObserver?.disconnect();
     this.doneObserver?.disconnect();
+    this.reanchorObserver?.disconnect();
     this.reattachObserver = null;
     this.anchorObserver = null;
     this.doneObserver = null;
@@ -131,6 +133,7 @@ export class ChatGPTAdapter implements PromptAdapter {
 
   private handleSubmit() {
     this.cb?.onSubmit();
+    this.reanchorObserver?.disconnect();
     this.preSubmitUserMsgKey = lastMsgKey(document.querySelectorAll<HTMLElement>(USER_MSG));
     this.watchForUserMessage();
   }
@@ -143,9 +146,27 @@ export class ChatGPTAdapter implements PromptAdapter {
       if (!newEl || lastMsgKey(all) === this.preSubmitUserMsgKey) return;
       this.anchorObserver?.disconnect();
       this.cb?.onAnchorReady(anchorFor(newEl));
+      this.watchForReanchor();
       this.watchForDone();
     });
     this.anchorObserver.observe(document.body, { childList: true, subtree: true });
+  }
+
+  // Confirmed live 2026-10-21: submitting from the new-chat page renders an optimistic user
+  // bubble, then navigates to /c/<id> and rebuilds the thread, discarding that bubble (and the
+  // card inserted after it). A fast reply ("hi") can finish the rebuild *before* the async ad
+  // fetch inserts the card, so a one-shot "anchor disconnected" check misses it: the card lands
+  // on the already-detached bubble. Instead, on every mutation, re-assert the card sits after the
+  // current last user bubble (reanchor is idempotent and a no-op when no card is showing). Runs
+  // until the next submit.
+  private watchForReanchor() {
+    this.reanchorObserver?.disconnect();
+    this.reanchorObserver = new MutationObserver(() => {
+      const el = lastOf(document.querySelectorAll<HTMLElement>(USER_MSG));
+      if (!el) return;
+      this.cb?.onReanchor?.(anchorFor(el));
+    });
+    this.reanchorObserver.observe(document.body, { childList: true, subtree: true });
   }
 
   private watchForDone() {

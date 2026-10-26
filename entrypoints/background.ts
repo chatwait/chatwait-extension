@@ -5,12 +5,14 @@ import { log } from '../lib/log';
 import { chooseAdByServeHistory } from '../lib/ad-selection';
 
 const AD_BUNDLE_INTERVAL_MS = 15 * 60 * 1000;
-// Adaptive sign-in poll: a signed-out device is actively waiting for its sign-in to land,
-// so it checks every minute; a signed-in one only needs to re-mint the 24h device token and
-// pick up unlink/profile changes, so every 30 min is plenty (the sign-in moment itself is
-// caught instantly by the tabs.onUpdated listener below, every MV3 worker wake re-polls via
-// init(), and an ads-bundle 401 forces an immediate re-check — see refreshAdBundle).
-const SIGNIN_CHECK_SIGNED_OUT_MS = 60 * 1000;
+// Adaptive sign-in poll. The sign-in moment itself is caught instantly by the tabs.onUpdated
+// listener below, the popup's CHECK_SIGNIN, every MV3 worker wake (init()), and an
+// ads-bundle 401 (see refreshAdBundle), so the timer is only a fallback for sign-ins that
+// happen outside the tab we opened. Signed out: every 15 min (was 60s; most signed-out
+// installs never sign in, and at 60s they were ~68% of all backend function calls).
+// Signed in: every 30 min, enough to re-mint the 24h device token and pick up unlink/profile
+// changes.
+const SIGNIN_CHECK_SIGNED_OUT_MS = 15 * 60 * 1000;
 const SIGNIN_CHECK_SIGNED_IN_MS = 30 * 60 * 1000;
 const SIGNIN_URL = 'https://chatwait.com/signin';
 const UNINSTALL_URL = 'https://api.chatwait.com/functions/v1/uninstall';
@@ -214,8 +216,17 @@ async function init() {
   // Sign-in status first: it stores the device_token that lets refreshAdBundle fetch an
   // authenticated bundle (ads carrying the ad_tokens the events endpoint requires) instead
   // of a tokenless one that couldn't bill impressions until the next 15-min refresh.
-  await refreshSignInStatus();
-  await refreshAdBundle();
+  // MV3 kills the worker after ~30s idle and any registered event (including tabs.onUpdated,
+  // which fires for every tab in the browser) wakes it and re-runs init(). So on wake, only
+  // hit the backend when the last successful check/fetch is older than its normal interval;
+  // otherwise just re-arm the timer for the remainder. The instant paths (sign-in tab
+  // listener, CHECK_SIGNIN, ads-bundle 401, the post-sign-in bundle refetch) stay unthrottled.
+  const signedIn = await storage.getSignedIn();
+  const signInInterval = signInCheckIntervalMs(signedIn);
+  const sinceSignInCheck = await storage.msSinceSignInCheck();
+  if (sinceSignInCheck >= signInInterval) await refreshSignInStatus();
+  else scheduleNextSignInCheck(signedIn, signInInterval - sinceSignInCheck);
+  if ((await storage.msSinceAdBundleFetch()) >= AD_BUNDLE_INTERVAL_MS) await refreshAdBundle();
   startEventFlusher();
 
   setInterval(refreshAdBundle, AD_BUNDLE_INTERVAL_MS);
@@ -226,12 +237,13 @@ async function init() {
 // sign-in tab listener, CHECK_SIGNIN from the popup, an ads-bundle 401) also reset the clock.
 let signInCheckTimer: ReturnType<typeof setTimeout> | null = null;
 
-function scheduleNextSignInCheck(signedIn: boolean) {
+function signInCheckIntervalMs(signedIn: boolean): number {
+  return signedIn ? SIGNIN_CHECK_SIGNED_IN_MS : SIGNIN_CHECK_SIGNED_OUT_MS;
+}
+
+function scheduleNextSignInCheck(signedIn: boolean, delayMs = signInCheckIntervalMs(signedIn)) {
   if (signInCheckTimer) clearTimeout(signInCheckTimer);
-  signInCheckTimer = setTimeout(
-    refreshSignInStatus,
-    signedIn ? SIGNIN_CHECK_SIGNED_IN_MS : SIGNIN_CHECK_SIGNED_OUT_MS,
-  );
+  signInCheckTimer = setTimeout(refreshSignInStatus, delayMs);
 }
 
 function refreshAdBundle(allowAuthRetry = true): Promise<void> {
@@ -307,6 +319,7 @@ async function checkSignInStatus(): Promise<boolean> {
     await storage.setDeviceToken(deviceToken);
     await storage.setSignedIn(linked);
     await storage.setProfileComplete(profileComplete);
+    await storage.markSignInChecked();
     if (uninstallToken) {
       // setUninstallURL needs no manifest permission. The endpoint records first and then
       // redirects to the optional survey, so closing that tab cannot lose the event.

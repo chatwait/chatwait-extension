@@ -15,6 +15,8 @@ const KEYS = {
   adServeHistory: 'chatwait_ad_serve_history',
   adBatchState: 'chatwait_ad_batch_state',
   adDedupState: 'chatwait_ad_dedup_state',
+  signInCheckedAt: 'chatwait_signin_checked_at',
+  adBundleFetchedAt: 'chatwait_ad_bundle_fetched_at',
 } as const;
 
 /** How long a remembered last-shown ad stays reusable. Generous versus the 60s impression
@@ -78,7 +80,26 @@ export const storage = {
     await browser.storage.local.set({
       [KEYS.adBundle]: bundle,
       [KEYS.adBatchState]: state,
+      [KEYS.adBundleFetchedAt]: Date.now(),
     });
+  },
+
+  /** Milliseconds since the last successful `/ads-bundle` fetch, or Infinity if there is no
+   * record (or the clock went backwards). Lets a service-worker wake skip a refetch when the
+   * cached bundle is still fresh. */
+  async msSinceAdBundleFetch(now = Date.now()): Promise<number> {
+    return msSince(await get<number>(KEYS.adBundleFetchedAt), now);
+  },
+
+  /** Milliseconds since the last successful `/device-status` check, or Infinity if there is
+   * no record. MV3 kills the worker after ~30s idle and every wake runs init(), so without
+   * this each wake (any tab update anywhere in the browser) cost a device-status call. */
+  async msSinceSignInCheck(now = Date.now()): Promise<number> {
+    return msSince(await get<number>(KEYS.signInCheckedAt), now);
+  },
+
+  async markSignInChecked(now = Date.now()): Promise<void> {
+    await set(KEYS.signInCheckedAt, now);
   },
 
   async getAdBundle(): Promise<AdCreative[]> {
@@ -287,6 +308,10 @@ export const storage = {
     await set(KEYS.installationHeartbeatAt, now);
   },
 };
+
+function msSince(ts: number | null, now: number): number {
+  return ts && ts <= now ? now - ts : Infinity;
+}
 
 async function get<T>(key: string): Promise<T | null> {
   const result = await browser.storage.local.get(key);

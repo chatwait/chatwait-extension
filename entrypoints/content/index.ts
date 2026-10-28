@@ -25,8 +25,8 @@ export default defineContentScript({
 
     log.info(`adapter attached for ${adapter.host}`);
 
-    // Fire-and-forget: refetch the ad bundle the moment the user lands on a host site, so a
-    // freshly won auction shows up here instead of waiting out the 15-minute background poll.
+    // Fire-and-forget prefetch: the background refetches the ad bundle if it is stale, so the
+    // first prompt here rarely waits on the network (there is no background poll any more).
     browser.runtime.sendMessage({ type: 'REFRESH_ADS' }).catch(() => {});
 
     try {

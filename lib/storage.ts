@@ -17,6 +17,7 @@ const KEYS = {
   adDedupState: 'chatwait_ad_dedup_state',
   signInCheckedAt: 'chatwait_signin_checked_at',
   adBundleFetchedAt: 'chatwait_ad_bundle_fetched_at',
+  signedOutCheckStreak: 'chatwait_signed_out_check_streak',
 } as const;
 
 /** How long a remembered last-shown ad stays reusable. Generous versus the 60s impression
@@ -100,6 +101,16 @@ export const storage = {
 
   async markSignInChecked(now = Date.now()): Promise<void> {
     await set(KEYS.signInCheckedAt, now);
+  },
+
+  /** Consecutive device-status checks that came back signed out. Drives the signed-out
+   * poll backoff in background.ts; reset to 0 by any signed-in result. */
+  async getSignedOutCheckStreak(): Promise<number> {
+    return (await get<number>(KEYS.signedOutCheckStreak)) ?? 0;
+  },
+
+  async setSignedOutCheckStreak(value: number): Promise<void> {
+    await set(KEYS.signedOutCheckStreak, value);
   },
 
   async getAdBundle(): Promise<AdCreative[]> {

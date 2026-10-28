@@ -4,16 +4,28 @@ import { flushQueue, startEventFlusher } from '../lib/schedule';
 import { log } from '../lib/log';
 import { chooseAdByServeHistory } from '../lib/ad-selection';
 
-const AD_BUNDLE_INTERVAL_MS = 15 * 60 * 1000;
+// The ad bundle is fetched on demand, not on a timer (T-20261027-2053-quiet-client-0.1.10):
+// most signed-in browsers never prompt in a given hour, so timer and worker-wake fetches were
+// ~95% of ads-bundle calls. A chat-site page load prefetches when the cache is older than
+// AD_BUNDLE_MAX_AGE_MS, and GET_AD refreshes first (waiting at most AD_BUNDLE_REFRESH_WAIT_MS)
+// when it still is, so an ad is never served from a bundle staler than it was under the old
+// 15-min poll. Ad tokens expire 24h after minting, so a bundle older than
+// AD_BUNDLE_EXPIRED_MS (a refresh kept failing) is never served at all.
+const AD_BUNDLE_MAX_AGE_MS = 15 * 60 * 1000;
+const AD_BUNDLE_REFRESH_WAIT_MS = 2000;
+const AD_BUNDLE_EXPIRED_MS = 23 * 60 * 60 * 1000;
 // Adaptive sign-in poll. The sign-in moment itself is caught instantly by the tabs.onUpdated
-// listener below, the popup's CHECK_SIGNIN, every MV3 worker wake (init()), and an
-// ads-bundle 401 (see refreshAdBundle), so the timer is only a fallback for sign-ins that
-// happen outside the tab we opened. Signed out: every 15 min (was 60s; most signed-out
-// installs never sign in, and at 60s they were ~68% of all backend function calls).
-// Signed in: every 30 min, enough to re-mint the 24h device token and pick up unlink/profile
-// changes.
+// listener below (any tab landing on chatwait.com/dashboard or /onboarding), the popup's
+// CHECK_SIGNIN, a prompt on a chat site while signed out, and an ads-bundle 401 (see
+// refreshAdBundle), so the timer is only a fallback. Signed out: 15 min, doubling per
+// consecutive signed-out result up to 2h (most signed-out installs never sign in). Signed in:
+// every 4h, well inside the 24h device-token TTL; an unlink or flag is caught live by
+// ads-bundle (401 / flagged ad) and events, and an onboarding completion by the tab listener.
 const SIGNIN_CHECK_SIGNED_OUT_MS = 15 * 60 * 1000;
-const SIGNIN_CHECK_SIGNED_IN_MS = 30 * 60 * 1000;
+const SIGNIN_CHECK_SIGNED_OUT_MAX_MS = 2 * 60 * 60 * 1000;
+const SIGNIN_CHECK_SIGNED_IN_MS = 4 * 60 * 60 * 1000;
+// Floor between the event-driven checks (chatwait.com page loads, signed-out prompts).
+const SIGNIN_EVENT_CHECK_MIN_MS = 60 * 1000;
 const SIGNIN_URL = 'https://chatwait.com/signin';
 const UNINSTALL_URL = 'https://api.chatwait.com/functions/v1/uninstall';
 
@@ -25,12 +37,12 @@ const ONBOARDING_AD = {
   kind: 'onboarding' as const,
 };
 
-// Tab ids for open sign-in tabs, so tabs.onUpdated (below) can push an immediate
-// sign-in refresh the moment one of them lands on /dashboard or /onboarding —
-// that redirect only happens after `/auth/callback` has already awaited the
-// device_ids upsert, so it's a reliable "linked now" signal instead of waiting
-// out the 60s poll.
-const signinTabIds = new Set<number>();
+// A chatwait.com tab landing on /dashboard or /onboarding is the "linked now" signal: that
+// redirect only happens after `/auth/callback` has already awaited the device_ids upsert, and
+// onboarding completion lands on /dashboard too. Matched on any tab rather than only tabs this
+// worker opened: MV3 kills the worker after ~30s idle, usually mid Google sign-in, which wiped
+// the old in-memory tab-id set. The chatwait.com host permission makes the URL visible.
+const SIGNED_IN_LANDING_RE = /^https:\/\/chatwait\.com\/(dashboard|onboarding)(\/|\?|#|$)/;
 let adSelectionQueue: Promise<void> = Promise.resolve();
 let adBundleRefreshInFlight: Promise<void> | null = null;
 
@@ -46,23 +58,19 @@ export default defineBackground(() => {
       // initDeviceId (not getDeviceId): on a fresh install nothing has generated
       // an ID yet, and that only happens later in the init flow below.
       storage.initDeviceId().then((id) => {
-        browser.tabs.create({ url: `${SIGNIN_URL}?device_id=${id}` }).then((tab) => {
-          if (tab.id !== undefined) signinTabIds.add(tab.id);
-        });
+        browser.tabs.create({ url: `${SIGNIN_URL}?device_id=${id}` });
       });
     }
   });
 
-  browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
-    if (!signinTabIds.has(tabId) || !changeInfo.url) return;
-    if (/^https:\/\/chatwait\.com\/(dashboard|onboarding)(\/|\?|$)/.test(changeInfo.url)) {
-      signinTabIds.delete(tabId);
-      refreshSignInStatus();
-    }
-  });
-
-  browser.tabs.onRemoved.addListener((tabId) => {
-    signinTabIds.delete(tabId);
+  browser.tabs.onUpdated.addListener((_tabId, changeInfo) => {
+    if (!changeInfo.url || !SIGNED_IN_LANDING_RE.test(changeInfo.url)) return;
+    // Unthrottled while signed out: a popup check moments before a quick Google sign-in must
+    // not swallow the transition. Signed in, this only refreshes profile_complete.
+    storage.getSignedIn().then((signedIn) => {
+      if (signedIn) refreshSignInStatusThrottled();
+      else refreshSignInStatus();
+    });
   });
 
   browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -82,7 +90,9 @@ export default defineBackground(() => {
       return true;
     }
     if (message.type === 'REFRESH_ADS') {
-      refreshAdBundle().then(() => sendResponse({ ok: true }));
+      // Sent by the content script on every chat-site page load: a prefetch so the next
+      // GET_AD rarely has to wait, skipped while the cached bundle is still fresh.
+      refreshAdBundleIfStale().then(() => sendResponse({ ok: true }));
       return true;
     }
     if (message.type === 'RECORD_EVENT') {
@@ -124,9 +134,7 @@ export default defineBackground(() => {
     }
     if (message.type === 'OPEN_SIGNIN') {
       storage.getDeviceId().then((id) => {
-        browser.tabs.create({ url: `${SIGNIN_URL}?device_id=${id}` }).then((tab) => {
-          if (tab.id !== undefined) signinTabIds.add(tab.id);
-        });
+        browser.tabs.create({ url: `${SIGNIN_URL}?device_id=${id}` });
         sendResponse({ ok: true });
       });
       return true;
@@ -146,22 +154,49 @@ function enqueueAdSelection<T>(select: () => Promise<T>): Promise<T> {
 }
 
 async function resolveAdRequest() {
-  // If another tab, the 15-minute timer, or batch exhaustion already started a refresh,
+  // If another tab, a page-load prefetch, or batch exhaustion already started a refresh,
   // wait for that single shared request before selecting. On failure refreshAdBundle keeps
   // the old cache, so this naturally falls back to the exhausted bundle rather than hiding
   // the ad or retry-looping.
   if (adBundleRefreshInFlight) await adBundleRefreshInFlight;
 
   if (!(await storage.getSignedIn())) {
+    // The user is prompting right now, so this is the moment a sign-in done elsewhere is worth
+    // noticing; the next prompt then gets an ad instead of waiting out the backed-off poll.
+    refreshSignInStatusThrottled();
     log.info('GET_AD: no ad, device is not signed in');
     return { ad: null, reason: 'not_signed_in' };
   }
 
-  const [{ bundle, state }, profileComplete, history] = await Promise.all([
+  // No timer keeps the bundle warm, so refresh it here when stale. Bounded: past the wait the
+  // ad comes from the cache (the refresh keeps running and the next GET_AD awaits it above).
+  if ((await storage.msSinceAdBundleFetch()) >= AD_BUNDLE_MAX_AGE_MS) {
+    await Promise.race([
+      refreshAdBundle(),
+      new Promise((resolve) => setTimeout(resolve, AD_BUNDLE_REFRESH_WAIT_MS)),
+    ]);
+    // A 401 during that refresh re-checks sign-in; if the device turned out to be unlinked,
+    // stop here rather than serve an ad that could no longer bill.
+    if (!(await storage.getSignedIn())) {
+      log.info('GET_AD: no ad, device was unlinked');
+      return { ad: null, reason: 'not_signed_in' };
+    }
+  }
+
+  const [batch, profileComplete, history, bundleAge] = await Promise.all([
     storage.getAdBatch(),
     storage.getProfileComplete(),
     storage.getAdServeHistory(),
+    storage.msSinceAdBundleFetch(),
   ]);
+  const { state } = batch;
+  let { bundle } = batch;
+  if (bundleAge >= AD_BUNDLE_EXPIRED_MS && (await storage.hasFetchedAdBundle())) {
+    // Every ad_token in it is (nearly) past its 24h TTL, so impressions on these ads could
+    // never bill. Keep only house ads, which carry no token.
+    log.warn('GET_AD: cached ad bundle is too old to bill and could not be refreshed');
+    bundle = bundle.filter((ad) => ad.is_house_ad);
+  }
 
   // Paid campaigns retain priority over house inventory. Within that pool, exhaust unseen
   // campaigns before rotating to the least-recently-served one, taking them in the server's
@@ -213,37 +248,49 @@ async function resolveAdRequest() {
 
 async function init() {
   await storage.initDeviceId();
-  // Sign-in status first: it stores the device_token that lets refreshAdBundle fetch an
-  // authenticated bundle (ads carrying the ad_tokens the events endpoint requires) instead
-  // of a tokenless one that couldn't bill impressions until the next 15-min refresh.
   // MV3 kills the worker after ~30s idle and any registered event (including tabs.onUpdated,
   // which fires for every tab in the browser) wakes it and re-runs init(). So on wake, only
-  // hit the backend when the last successful check/fetch is older than its normal interval;
-  // otherwise just re-arm the timer for the remainder. The instant paths (sign-in tab
-  // listener, CHECK_SIGNIN, ads-bundle 401, the post-sign-in bundle refetch) stay unthrottled.
+  // hit the backend when the last successful check is older than its normal interval;
+  // otherwise just re-arm the timer for the remainder. The ad bundle is not fetched here at
+  // all (see AD_BUNDLE_MAX_AGE_MS); the sign-in transition still fetches one immediately.
   const signedIn = await storage.getSignedIn();
-  const signInInterval = signInCheckIntervalMs(signedIn);
+  const signInInterval = await signInCheckIntervalMs(signedIn);
   const sinceSignInCheck = await storage.msSinceSignInCheck();
   if (sinceSignInCheck >= signInInterval) await refreshSignInStatus();
-  else scheduleNextSignInCheck(signedIn, signInInterval - sinceSignInCheck);
-  if ((await storage.msSinceAdBundleFetch()) >= AD_BUNDLE_INTERVAL_MS) await refreshAdBundle();
+  else scheduleNextSignInCheck(signInInterval - sinceSignInCheck);
   startEventFlusher();
-
-  setInterval(refreshAdBundle, AD_BUNDLE_INTERVAL_MS);
 }
 
 // One pending sign-in check at a time; every refreshSignInStatus() call reschedules it from
 // scratch at the cadence matching the freshly observed state, so out-of-band refreshes (the
-// sign-in tab listener, CHECK_SIGNIN from the popup, an ads-bundle 401) also reset the clock.
+// chatwait.com tab listener, CHECK_SIGNIN from the popup, an ads-bundle 401) also reset the clock.
 let signInCheckTimer: ReturnType<typeof setTimeout> | null = null;
 
-function signInCheckIntervalMs(signedIn: boolean): number {
-  return signedIn ? SIGNIN_CHECK_SIGNED_IN_MS : SIGNIN_CHECK_SIGNED_OUT_MS;
+async function signInCheckIntervalMs(signedIn: boolean): Promise<number> {
+  if (signedIn) return SIGNIN_CHECK_SIGNED_IN_MS;
+  const streak = await storage.getSignedOutCheckStreak();
+  return Math.min(
+    SIGNIN_CHECK_SIGNED_OUT_MS * 2 ** Math.max(0, streak - 1),
+    SIGNIN_CHECK_SIGNED_OUT_MAX_MS,
+  );
 }
 
-function scheduleNextSignInCheck(signedIn: boolean, delayMs = signInCheckIntervalMs(signedIn)) {
+function scheduleNextSignInCheck(delayMs: number) {
   if (signInCheckTimer) clearTimeout(signInCheckTimer);
   signInCheckTimer = setTimeout(refreshSignInStatus, delayMs);
+}
+
+/** For the event-driven checks, which can fire repeatedly (every chatwait.com navigation,
+ * every signed-out prompt): skip when a check succeeded within SIGNIN_EVENT_CHECK_MIN_MS. */
+async function refreshSignInStatusThrottled(): Promise<void> {
+  if ((await storage.msSinceSignInCheck()) < SIGNIN_EVENT_CHECK_MIN_MS) return;
+  await refreshSignInStatus();
+}
+
+function refreshAdBundleIfStale(): Promise<void> {
+  return storage.msSinceAdBundleFetch().then((age) => {
+    if (age >= AD_BUNDLE_MAX_AGE_MS) return refreshAdBundle();
+  });
 }
 
 function refreshAdBundle(allowAuthRetry = true): Promise<void> {
@@ -288,7 +335,7 @@ async function refreshAdBundleOnce(allowAuthRetry = true) {
 
 async function refreshSignInStatus(): Promise<boolean> {
   const signedIn = await checkSignInStatus();
-  scheduleNextSignInCheck(signedIn);
+  scheduleNextSignInCheck(await signInCheckIntervalMs(signedIn));
   return signedIn;
 }
 
@@ -320,6 +367,9 @@ async function checkSignInStatus(): Promise<boolean> {
     await storage.setSignedIn(linked);
     await storage.setProfileComplete(profileComplete);
     await storage.markSignInChecked();
+    await storage.setSignedOutCheckStreak(
+      linked ? 0 : (await storage.getSignedOutCheckStreak()) + 1,
+    );
     if (uninstallToken) {
       // setUninstallURL needs no manifest permission. The endpoint records first and then
       // redirects to the optional survey, so closing that tab cannot lose the event.
@@ -336,7 +386,7 @@ async function checkSignInStatus(): Promise<boolean> {
     if (!hadToken && deviceToken) {
       // First time this device gets its token (just signed in): the cached bundle was fetched
       // unauthenticated and its ads carry no ad_tokens, so impressions from it can't bill.
-      // Refetch now instead of waiting out the 15-min bundle interval.
+      // Refetch now instead of waiting for the next GET_AD to find it stale.
       await refreshAdBundle();
     }
     log.info(`sign-in status refreshed: signedIn=${linked} profileComplete=${profileComplete}`);

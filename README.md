@@ -1,6 +1,6 @@
 # Chatwait
 
-Chatwait is a browser extension that shows sponsored text cards while ChatGPT, Claude, and Gemini are generating responses. Users earn 50% of ad revenue from qualified impressions.
+Chatwait is a browser extension that shows sponsored text cards while ChatGPT, Claude, Gemini, and Meta AI are generating responses. Users earn 50% of ad revenue from qualified impressions.
 
 The extension is open source and intentionally minimal: it does not read prompts or AI responses.
 
@@ -9,6 +9,7 @@ The extension is open source and intentionally minimal: it does not read prompts
 - `https://chatgpt.com/*`
 - `https://claude.ai/*`
 - `https://gemini.google.com/*`
+- `https://www.meta.ai/*` (and `https://meta.ai/*`)
 
 ## Installation
 

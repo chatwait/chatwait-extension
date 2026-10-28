@@ -1,6 +1,7 @@
 import { ChatGPTAdapter } from './adapters/chatgpt';
 import { ClaudeAdapter } from './adapters/claude';
 import { GeminiAdapter } from './adapters/gemini';
+import { MetaAIAdapter } from './adapters/meta';
 import type { PromptAdapter } from './adapters/types';
 import { attachAdInjection } from './shared';
 import { log } from '../../lib/log';
@@ -11,6 +12,8 @@ export default defineContentScript({
     'https://chatgpt.com/*',
     'https://claude.ai/*',
     'https://gemini.google.com/*',
+    'https://www.meta.ai/*',
+    'https://meta.ai/*',
   ],
   async main() {
     if (document.readyState === 'loading') {
@@ -47,9 +50,9 @@ export default defineContentScript({
       }
     } catch (err) {
       // browser.storage.* throws "Extension context invalidated" when this tab was already
-      // open before the extension was reinstalled/updated — the old content script instance
+      // open before the extension was reinstalled/updated â€” the old content script instance
       // is orphaned and every extension API call from here on will fail the same way.
-      log.warn('not ready: extension context invalidated (reload this tab — it was open before the extension was last installed/updated)', err);
+      log.warn('not ready: extension context invalidated (reload this tab â€” it was open before the extension was last installed/updated)', err);
       return;
     }
 
@@ -62,5 +65,6 @@ function resolveAdapter(): PromptAdapter | null {
   if (host === 'chatgpt.com') return new ChatGPTAdapter();
   if (host === 'claude.ai') return new ClaudeAdapter();
   if (host === 'gemini.google.com') return new GeminiAdapter();
+  if (host === 'meta.ai' || host === 'www.meta.ai' || host.endsWith('.meta.ai')) return new MetaAIAdapter();
   return null;
 }

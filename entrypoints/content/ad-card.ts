@@ -1,6 +1,6 @@
 import type { AdCreative } from "./adapters/types";
 
-/** House and onboarding ads have no advertiser-supplied icon_url — show the bundled Chatwait
+/** House and onboarding ads have no advertiser-supplied icon_url â€” show the bundled Chatwait
  * mark (public/chatwait-icon-round.svg, web-accessible per wxt.config.ts) instead of falling
  * back to a plain sponsor-initial letter. */
 function iconSrc(ad: AdCreative): string | undefined {
@@ -10,7 +10,7 @@ function iconSrc(ad: AdCreative): string | undefined {
 }
 
 // Static CSS text (no advertiser-supplied data ever goes into this string), assigned to a
-// <style> element's textContent below — not an innerHTML sink, so AMO's linter has nothing
+// <style> element's textContent below â€” not an innerHTML sink, so AMO's linter has nothing
 // to flag. Every other node in the card is built with document.createElement/appendChild,
 // and ad-supplied fields (text, sponsor_name, url, icon_url) are set via textContent/href/src,
 // never parsed as markup, so a malicious creative (self-serve advertiser input) can't inject
@@ -70,10 +70,18 @@ const CARD_CSS = `
     .dismiss { color: #71717a; }
     .dismiss:hover { color: #d4d4d8; }
   }
+
+  :host([data-docked]) .row, .row.docked {
+    padding: 10px 14px;
+    border-radius: 12px;
+    background: rgba(127,127,142,0.08);
+    border: 1px solid rgba(127,127,142,0.18);
+    backdrop-filter: blur(8px);
+  }
 `;
 
 /** Builds the card's static DOM skeleton (style + row + icon/text/dismiss slots), with no
- * advertiser data in it yet — `show()` fills in the ad-specific fields afterward. */
+ * advertiser data in it yet â€” `show()` fills in the ad-specific fields afterward. */
 function buildCardSkeleton(): {
   fragment: DocumentFragment;
   iconEl: HTMLElement;
@@ -104,7 +112,7 @@ function buildCardSkeleton(): {
   const dismissEl = document.createElement("button");
   dismissEl.className = "dismiss";
   dismissEl.setAttribute("aria-label", "Dismiss ad");
-  dismissEl.textContent = "×";
+  dismissEl.textContent = "Ã—";
   row.appendChild(dismissEl);
 
   fragment.appendChild(row);
@@ -118,7 +126,7 @@ export class AdCard {
    * sponsored link itself is clicked (not the dismiss button), and is passed the anchor
    * element so the caller can rewrite `href` just before the browser navigates (e.g. to add
    * the impression id once it's known to have qualified). `onDismiss` fires when the X button
-   * removes this card — the caller must stop its impression tracker there too, since removal
+   * removes this card â€” the caller must stop its impression tracker there too, since removal
    * doesn't otherwise interrupt dwell tracking (which only watches tab visibility/focus, not
    * this element's presence) and a dismissed card could otherwise still silently qualify and
    * bill. Returns the rendered host element. */
@@ -132,14 +140,25 @@ export class AdCard {
     this.host.setAttribute("data-chatwait", "");
     // Host has no light-DOM styling of its own, so it inherits sizing from whatever it's
     // inserted into. On gemini.google.com the message row is a flex column with
-    // align-items: center, which — absent an explicit width — shrinks the host to its
+    // align-items: center, which â€” absent an explicit width â€” shrinks the host to its
     // content width and centers it instead of spanning the row (the divider line ends up
     // short and centered instead of full-width). Force block + 100% width so the host's
     // size never depends on the host page's flex/align-items choices.
     this.host.style.display = "block";
     this.host.style.width = "100%";
+    const isBefore =
+      (afterEl as any)?._chatwaitPlacement === "before" ||
+      afterEl?.dataset?.chatwaitPlacement === "before";
+    if (isBefore) {
+      this.host.setAttribute("data-docked", "");
+      this.host.style.marginBottom = "8px";
+    }
+
     const root = this.host.attachShadow({ mode: "closed" });
     const { fragment, iconEl, anchor, dismissEl } = buildCardSkeleton();
+    if (isBefore) {
+      fragment.querySelector(".row")?.classList.add("docked");
+    }
     root.appendChild(fragment);
 
     const isHouse = ad.is_house_ad || ad.kind === "onboarding";
@@ -172,19 +191,29 @@ export class AdCard {
     if (opts?.onClick) {
       anchor.addEventListener("click", () => opts.onClick!(anchor));
     }
-    afterEl.after(this.host);
+    if (isBefore) {
+      afterEl.before(this.host);
+    } else {
+      afterEl.after(this.host);
+    }
     return this.host;
   }
 
-  /** Move the already-shown card to sit immediately after a new anchor element. Used when the
-   * host page tears down and rebuilds the DOM around the user message (Gemini's transient →
-   * permanent turn swap): the card host node itself survives the teardown as a detached node,
-   * so re-inserting it keeps the same shadow root, listeners, and impression timing. Only moves
-   * when it isn't already correctly positioned, so it's cheap/idempotent to call on every
-   * mutation while the rebuild settles. No-op if no card is currently shown. */
+  /** Move the already-shown card to sit immediately before/after a new anchor element. */
   reanchor(afterEl: HTMLElement) {
-    if (this.host && afterEl.nextElementSibling !== this.host) {
-      afterEl.after(this.host);
+    if (!this.host) return;
+    const isBefore =
+      (afterEl as any)?._chatwaitPlacement === "before" ||
+      afterEl?.dataset?.chatwaitPlacement === "before";
+    if (isBefore) {
+      this.host.style.marginBottom = "8px";
+      if (afterEl.previousElementSibling !== this.host) {
+        afterEl.before(this.host);
+      }
+    } else {
+      if (afterEl.nextElementSibling !== this.host) {
+        afterEl.after(this.host);
+      }
     }
   }
 
@@ -197,7 +226,7 @@ export class AdCard {
     this.host = null;
   }
 
-  /** X button: removes only this card instance. No lasting state — the next prompt gets
+  /** X button: removes only this card instance. No lasting state â€” the next prompt gets
    * its own ad and its own dismiss button. */
   private dismiss() {
     this.remove();
